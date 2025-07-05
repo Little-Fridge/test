@@ -10,6 +10,7 @@ import json
 import sys
 import os
 from pathlib import Path
+import types
 
 # 添加项目根目录到Python路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -17,6 +18,51 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from model import llava_onevision_rekv
 from decord import VideoReader, cpu
 import numpy as np
+
+
+# 用于保存检索信息的全局变量
+last_retrieved_indices = None
+
+
+def setup_retrieval_capture(model):
+    """设置检索信息捕获"""
+    global last_retrieved_indices
+    last_retrieved_indices = None
+    
+    # 检查kv_cache是否已创建
+    if not hasattr(model, 'kv_cache') or model.kv_cache is None:
+        print("警告: kv_cache未创建，无法设置检索信息捕获")
+        return
+    
+    # 对每个层的KV cache进行monkey patching
+    for i, layer_kv in enumerate(model.kv_cache):
+        if hasattr(layer_kv, 'reset_retrieval'):
+            # 保存原始方法
+            original_reset = layer_kv.reset_retrieval
+            
+            # 创建包装函数
+            def make_wrapped_reset(original_func, kv_layer):
+                def wrapped_reset():
+                    global last_retrieved_indices
+                    # 在重置之前保存检索信息
+                    if hasattr(kv_layer, 'retrieved_block_indices') and kv_layer.retrieved_block_indices is not None:
+                        if isinstance(kv_layer.retrieved_block_indices, list):
+                            last_retrieved_indices = [idx.copy() if isinstance(idx, list) else idx for idx in kv_layer.retrieved_block_indices]
+                        else:
+                            last_retrieved_indices = kv_layer.retrieved_block_indices
+                    else:
+                        last_retrieved_indices = None
+                    # 调用原始的reset_retrieval方法
+                    return original_func()
+                return wrapped_reset
+            
+            # 替换方法
+            layer_kv.reset_retrieval = make_wrapped_reset(original_reset, layer_kv)
+
+
+def get_last_retrieved_indices():
+    """获取最后一次检索的索引"""
+    return last_retrieved_indices
 
 
 def load_video(video_path, sample_fps=1.0):
@@ -59,7 +105,7 @@ def test_stream_video(video_path, prompt, model_name="llava_ov_7b", sample_fps=1
     model, processor = llava_onevision_rekv.load_model(
         model_path=model_path,
         n_local=4000,    # 本地窗口大小
-        topk=16,         # 检索块数
+        topk=8,          # 检索块数 (减少到8个，使检索效果更明显)
         chunk_size=1     # 块大小
     )
     
@@ -78,6 +124,9 @@ def test_stream_video(video_path, prompt, model_name="llava_ov_7b", sample_fps=1
     model.clear_cache()
     model.encode_init_prompt()
     print("ReKV初始化完成!")
+    
+    # 设置检索信息捕获（在kv_cache创建后）
+    setup_retrieval_capture(model)
     
     # 4. 流式处理视频
     print("\n4. 开始流式处理视频...")
@@ -108,9 +157,24 @@ def test_stream_video(video_path, prompt, model_name="llava_ov_7b", sample_fps=1
         memory_usage = model.calc_memory_usage() / (1024**3)
         print(f"当前KV-Cache内存使用: {memory_usage:.2f} GB")
         
+        # 添加更详细的内存信息
+        if hasattr(model, 'kv_cache') and model.kv_cache is not None:
+            if hasattr(model.kv_cache[0], 'length'):
+                total_tokens = model.kv_cache[0].length
+                print(f"总token数: {total_tokens}")
+                print(f"本地窗口大小: {model.n_local}")
+                print(f"是否触发offload: {total_tokens > model.n_local + 13}")
+                if hasattr(model.kv_cache[0], 'num_global_block'):
+                    print(f"CPU中的全局块数: {model.kv_cache[0].num_global_block}")
+        
         # 如果处理了足够的帧，可以进行问答测试
         if chunk_idx >= 0:  # 可以从第一个块开始测试
             print(f"测试问答 (基于前 {end_frame} 帧)...")
+            
+            # 显示检索状态
+            total_blocks = model.kv_cache[0].num_global_block if hasattr(model.kv_cache[0], 'num_global_block') else 0
+            retrieval_enabled = total_blocks > model.topk
+            print(f"检索模式: {'启用' if retrieval_enabled else '禁用'} (总块数: {total_blocks}, topk: {model.topk})")
             
             input_text = {
                 "question": prompt,
@@ -119,15 +183,40 @@ def test_stream_video(video_path, prompt, model_name="llava_ov_7b", sample_fps=1
             
             answer = model.question_answering(input_text, max_new_tokens=128)
             print(f"基于前 {end_frame} 帧的回答: {answer}")
+            
+            # 获取检索到的帧序号
+            retrieved_indices = get_last_retrieved_indices()
+            if retrieved_indices is not None and len(retrieved_indices) > 0:
+                # 转换块索引为帧序号 (每个块对应一帧)
+                retrieved_frame_indices = retrieved_indices[0] if isinstance(retrieved_indices, list) and len(retrieved_indices) > 0 else retrieved_indices
+                print(f"检索到的帧序号: {retrieved_frame_indices}")
+            else:
+                print("检索到的帧序号: 无 (使用所有帧或检索未启用)")
     
     # 5. 最终问答（基于完整视频）
     print("\n5. 最终问答 (基于完整视频)...")
+    
+    # 显示最终检索状态
+    total_blocks = model.kv_cache[0].num_global_block if hasattr(model.kv_cache[0], 'num_global_block') else 0
+    retrieval_enabled = total_blocks > model.topk
+    print(f"最终检索模式: {'启用' if retrieval_enabled else '禁用'} (总块数: {total_blocks}, topk: {model.topk})")
+    
     input_text = {
         "question": prompt,
         "prompt": model.get_prompt(prompt)
     }
     
     final_answer = model.question_answering(input_text, max_new_tokens=256)
+    
+    # 显示最终问答的检索信息
+    print(f"最终回答: {final_answer}")
+    retrieved_indices = get_last_retrieved_indices()
+    if retrieved_indices is not None and len(retrieved_indices) > 0:
+        # 转换块索引为帧序号 (每个块对应一帧)
+        retrieved_frame_indices = retrieved_indices[0] if isinstance(retrieved_indices, list) and len(retrieved_indices) > 0 else retrieved_indices
+        print(f"最终问答检索到的帧序号: {retrieved_frame_indices}")
+    else:
+        print("最终问答检索到的帧序号: 无 (使用所有帧或检索未启用)")
     
     # 6. 输出结果
     print("\n" + "=" * 60)
@@ -136,7 +225,6 @@ def test_stream_video(video_path, prompt, model_name="llava_ov_7b", sample_fps=1
     print(f"视频总帧数: {num_frames}")
     print(f"处理块数: {num_chunks}")
     print(f"提示词: {prompt}")
-    print(f"最终回答: {final_answer}")
     print(f"最终KV-Cache内存使用: {model.calc_memory_usage() / (1024**3):.2f} GB")
     print("=" * 60)
     
