@@ -52,7 +52,7 @@ def rekv_attention_forward(
             past_key_value = ContextManager(
                 position_bias,
                 n_init, n_local, 
-                block_size, max_cached_block, topk, chunk_size, exc_block_size,
+                block_size, max_cached_block, topk, exc_block_size,
                 fattn,
                 async_global_stream,
                 pin_memory,

@@ -190,7 +190,7 @@ class ContextManager:
     def __init__(self, 
                  position_embedding,
                  n_init, n_local, 
-                 block_size, max_cached_block, topk, chunk_size, exc_block_size, 
+                 block_size, max_cached_block, topk, exc_block_size, 
                  fattn: bool = False,
                  async_global_stream: bool = False,
                  pin_memory: bool = False,
@@ -205,7 +205,11 @@ class ContextManager:
         self.exc_block_size = exc_block_size
         assert exc_block_size <= n_local # no global token in input
         self.topk = topk
-        self.chunk_size = chunk_size
+        
+        # Dynamic chunk management - store chunk info for each unit
+        self.chunk_info = []  # List of chunk info for each unit: [unit_id][chunk_id] = (start_idx, size)
+        self.chunk_scores = []  # List of chunk scores for each unit: [unit_id][chunk_id] = score
+        
         self.Attn, _ = get_multi_stage_dot_production_attention(fattn)
         self.fattn = fattn
         self.initialized = False
@@ -282,6 +286,10 @@ class ContextManager:
         self.global_blocks = [[] for _ in range(self.num_units)] # context memory's KV-Cache: [ batch_size x [memory_unit] ]
         self.cached_blocks = [{} for _ in range(self.num_units)] # relavency scores of blocks: batch_size x {block_id: block_score}
         self.num_global_block = 0
+
+        # Initialize chunk information for dynamic chunk management
+        self.chunk_info = [[] for _ in range(self.num_units)]  # [unit_id][chunk_id] = (start_idx, size)
+        self.chunk_scores = [[] for _ in range(self.num_units)]  # [unit_id][chunk_id] = score
 
         # context memory's representative keys: batch_size x (n_blocks, hidden_dim)
         self.block_k = [VectorTensor(
@@ -418,7 +426,7 @@ class ContextManager:
         return global_h_k, global_h_v 
 
     # Get the indices of the top-k vectors in self.block_k[u] that have the highest similarity with global_h_q[u].
-    # ret: batch_size x topk
+    # ret: batch_size x topk (dynamic, no chunk size constraints)
     def _calc_block_topk(
         self, global_h_q
     ):
@@ -449,21 +457,27 @@ class ContextManager:
 
         if logits is not None:
             self.similarity = logits
-            assert self.topk % self.chunk_size == 0
-            remainder_size = logits.shape[1] % self.chunk_size
-            chunked_logits = logits[:, :logits.shape[1]-remainder_size].reshape(self.num_units, -1, self.chunk_size).mean(dim=-1)  # (batch_size, block_num // chunk_size)
-            if remainder_size > 0:
-                remainder_logits = logits[:, -remainder_size:].mean(dim=-1, keepdim=True)  # (batch_size, 1)
-                chunked_logits = torch.cat([chunked_logits, remainder_logits], dim=1)
-            ret = chunked_logits.topk(self.topk//self.chunk_size, dim=1).indices
-            ret = ret.sort(dim=1)[0][:, :, None]  # (batch_size, topk//chunk_size, 1)
-            ret = ret * self.chunk_size + torch.arange(self.chunk_size, device=ret.device)[None, None, :]  # (batch_size, topk//chunk_size, chunk_size)
-            ret = ret.reshape(self.num_units, -1)  # (batch_size, topk)
-            ret = ret.cpu().tolist()
-
-            # NOTE: The last chunk might cause an index overflow
+            
+            # Use dynamic chunking without size constraints
+            ret = self._get_adaptive_chunks(logits, self.topk)
+            
+            # Update chunk information
             for u in range(self.num_units):
-                ret[u] = list(filter(lambda idx: idx < logits.shape[1], ret[u]))
+                if u >= len(self.chunk_info):
+                    self.chunk_info.extend([[] for _ in range(u + 1 - len(self.chunk_info))])
+                    self.chunk_scores.extend([[] for _ in range(u + 1 - len(self.chunk_scores))])
+                
+                # Store chunk information for retrieved blocks
+                self.chunk_info[u] = []
+                self.chunk_scores[u] = []
+                
+                for i, block_idx in enumerate(ret[u]):
+                    chunk_start = block_idx
+                    chunk_size = 1  # Each block is treated as a chunk of size 1
+                    chunk_score = logits[u][block_idx].item() if block_idx < len(logits[u]) else 0.0
+                    
+                    self.chunk_info[u].append((chunk_start, chunk_size))
+                    self.chunk_scores[u].append(chunk_score)
 
         return ret
 
@@ -702,3 +716,115 @@ class ContextManager:
             for block in self.global_blocks[u]:
                 memory += block.calculate_cpu_memory()
         return memory
+    
+    def _create_dynamic_chunks(self, logits):
+        """
+        Create dynamic chunks based on similarity scores without size constraints.
+        
+        Args:
+            logits: (batch_size, block_num) similarity scores
+            
+        Returns:
+            List of chunk indices for each unit
+        """
+        ret = []
+        
+        for u in range(self.num_units):
+            unit_logits = logits[u]  # (block_num,)
+            
+            # Get top-k indices based on similarity scores
+            if len(unit_logits) <= self.topk:
+                # If we have fewer blocks than topk, take all
+                indices = list(range(len(unit_logits)))
+            else:
+                # Get top-k indices
+                _, top_indices = torch.topk(unit_logits, self.topk)
+                indices = top_indices.cpu().tolist()
+                indices.sort()  # Sort to maintain order
+            
+            # Create or update chunk info for this unit
+            if u >= len(self.chunk_info):
+                self.chunk_info.extend([[] for _ in range(u + 1 - len(self.chunk_info))])
+                self.chunk_scores.extend([[] for _ in range(u + 1 - len(self.chunk_scores))])
+            
+            # Store chunk information
+            self.chunk_info[u] = []
+            self.chunk_scores[u] = []
+            
+            # Create chunks dynamically - each selected block becomes a chunk
+            for i, block_idx in enumerate(indices):
+                chunk_start = block_idx
+                chunk_size = 1  # Each block is a chunk of size 1
+                chunk_score = unit_logits[block_idx].item()
+                
+                self.chunk_info[u].append((chunk_start, chunk_size))
+                self.chunk_scores[u].append(chunk_score)
+            
+            ret.append(indices)
+        
+        return ret
+
+    def _get_adaptive_chunks(self, logits, target_count=None):
+        """
+        Get adaptive chunks based on similarity distribution.
+        
+        Args:
+            logits: (batch_size, block_num) similarity scores
+            target_count: target number of blocks to retrieve (defaults to self.topk)
+            
+        Returns:
+            List of chunk indices for each unit
+        """
+        if target_count is None:
+            target_count = self.topk
+            
+        ret = []
+        
+        for u in range(self.num_units):
+            unit_logits = logits[u]  # (block_num,)
+            
+            if len(unit_logits) <= target_count:
+                # If we have fewer blocks than target, take all
+                indices = list(range(len(unit_logits)))
+            else:
+                # Use adaptive chunking based on similarity distribution
+                # Sort by similarity score
+                sorted_indices = torch.argsort(unit_logits, descending=True)
+                
+                # Take top target_count blocks
+                selected_indices = sorted_indices[:target_count]
+                
+                # Sort selected indices to maintain order
+                indices = selected_indices.sort().values.cpu().tolist()
+            
+            ret.append(indices)
+        
+        return ret
+
+    def get_chunk_info(self, unit_id=None):
+        """
+        Get chunk information for specified unit or all units.
+        
+        Args:
+            unit_id: specific unit ID, or None for all units
+            
+        Returns:
+            Chunk information: [(start_idx, size), ...] for one unit or list of such for all units
+        """
+        if unit_id is not None:
+            return self.chunk_info[unit_id] if unit_id < len(self.chunk_info) else []
+        return self.chunk_info
+
+    def get_chunk_scores(self, unit_id=None):
+        """
+        Get chunk scores for specified unit or all units.
+        
+        Args:
+            unit_id: specific unit ID, or None for all units
+            
+        Returns:
+            Chunk scores: [score, ...] for one unit or list of such for all units
+        """
+        if unit_id is not None:
+            return self.chunk_scores[unit_id] if unit_id < len(self.chunk_scores) else []
+        return self.chunk_scores

@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""
+简单的流式视频测试脚本
+用于测试一条流视频和一条prompt的ReKV功能
+"""
+
+import torch
+import argparse
+import json
+import sys
+import os
+from pathlib import Path
+import types
+
+# 添加项目根目录到Python路径
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from model import llava_onevision_rekv
+from decord import VideoReader, cpu
+import numpy as np
+from PIL import Image
+
+'''
+personalize_set = {"sks": 
+    {
+    "images": [PIL.Image.Image],
+    "info": "A close-up of a vintage car's front bumper.",
+    "category": "car"
+    }
+}
+'''
+
+# 用于保存检索信息的全局变量
+last_retrieved_indices = None
+
+
+def setup_retrieval_capture(model):
+    """设置检索信息捕获"""
+    global last_retrieved_indices
+    last_retrieved_indices = None
+    
+    # 检查kv_cache是否已创建
+    if not hasattr(model, 'kv_cache') or model.kv_cache is None:
+        print("警告: kv_cache未创建，无法设置检索信息捕获")
+        return
+    
+    # 对每个层的KV cache进行monkey patching
+    for i, layer_kv in enumerate(model.kv_cache):
+        if hasattr(layer_kv, 'reset_retrieval'):
+            # 保存原始方法
+            original_reset = layer_kv.reset_retrieval
+            
+            # 创建包装函数
+            def make_wrapped_reset(original_func, kv_layer):
+                def wrapped_reset():
+                    global last_retrieved_indices
+                    # 在重置之前保存检索信息
+                    if hasattr(kv_layer, 'retrieved_block_indices') and kv_layer.retrieved_block_indices is not None:
+                        if isinstance(kv_layer.retrieved_block_indices, list):
+                            last_retrieved_indices = [idx.copy() if isinstance(idx, list) else idx for idx in kv_layer.retrieved_block_indices]
+                        else:
+                            last_retrieved_indices = kv_layer.retrieved_block_indices
+                    else:
+                        last_retrieved_indices = None
+                    # 调用原始的reset_retrieval方法
+                    return original_func()
+                return wrapped_reset
+            
+            # 替换方法
+            layer_kv.reset_retrieval = make_wrapped_reset(original_reset, layer_kv)
+
+
+def get_last_retrieved_indices():
+    """获取最后一次检索的索引"""
+    return last_retrieved_indices
+
+def test_personalization(personalize_set, prompt, input_image, model_name="llava_ov_7b"):
+    model_path = f'model_zoo/{model_name}'
+    
+    model, processor = llava_onevision_rekv.load_model(
+        model_path=model_path,
+        n_local=4000,    # 本地窗口大小
+        topk=8,          # 检索块数
+        chunk_size=1     # 块大小
+    )
+
+    model.clear_cache()
+    model.encode_init_prompt()
+    # 设置检索信息捕获（在kv_cache创建后）
+    setup_retrieval_capture(model)
+
+    for name, content in personalize_set.items():
+        pair = {
+            "id": name,
+            "category": content['category'],
+            "images": content["images"],
+            "text": content['info']
+        }
+        model.encode_personalized_pair(pair)
+
+        memory_usage = model.calc_memory_usage() / (1024**3)
+        print(f"当前KV-Cache内存使用: {memory_usage:.2f} GB")
+        
+        
+    input_text = {
+        "question": prompt,
+        "prompt": model.get_prompt(prompt)
+    }
+    answer = model.visual_question_answering(input_image, input_text, max_new_tokens=128)
+
+
+
+if __name__ == "__main__":
+    
+    json_path = './YoLLaVA/yollava-visual-qa.json'
+    ds =  json.loads(open(json_path).read())
+
+    
+    personalize_set = {}
+    
+    # 测试前5个数据
+    i = 0
+    for name in ds:
+        if i > 5:
+            break
+        i += 1
+        personalize_set[name] = {}
+        personalize_set[name]['category'] = None
+        personalize_set[name]['info'] = None
+        personalize_set[name]['images'] = []
+        for filename in os.listdir(f'./YoLLaVA/train/{name}'):
+            image_path = f'./YoLLaVA/train/{name}/{filename}'
+            personalize_set[name]['images'].append(Image.open(image_path))
+
+    print("个性化数据集已加载，包含以下项目:")
+    for k, v in personalize_set.items():
+        print(f"name: {k}, category: {v['category']}, info: {v['info']}, images num: {len(v['images'])}")
+    print("图片已经加载，开始个性化测试...")
+    
+    test_personalization(
+        personalize_set=personalize_set,
+        prompt="What is the car in the image?",
+        input_image="refcoco/crop/821_0.jpg",
+        model_name="LLaVA/llava-onevision-qwen2-7b-ov-hf"
+    )

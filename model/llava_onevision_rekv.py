@@ -106,6 +106,83 @@ class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV)
         return output
 
 
+
+    @torch.inference_mode()
+    def visual_question_answering(self, image, input_text, max_new_tokens=128, retrieved_indices=None):
+        device = self.device
+        stop_token_ids = [self.processor.tokenizer.eos_token_id]
+
+        output_ids = []
+        stopped = False
+
+        # NOTE: Only input the question to perform retrieval.
+        input_ids = self.processor.tokenizer(input_text['question']).input_ids
+        input_ids = torch.as_tensor([input_ids], device=device)
+        for layer_kv in self.kv_cache:  # activate retrieval mode
+            layer_kv.set_retrieval()
+
+        if retrieved_indices is None:  # Internal retrieval
+            out = self.language_model(input_ids=input_ids, use_cache=True, past_key_values=self.kv_cache)
+            past_key_values = out.past_key_values  # Retrieved KV-Cache: L x 2 x (B, h, N, Dh)
+        else:  # External retrieval
+            for layer_kv in self.kv_cache:
+                assert layer_kv.block_size == self.n_frame_tokens, f'block_size: {layer_kv.block_size}, n_frame_tokens: {self.n_frame_tokens}'
+                layer_kv.set_retrieved_block_indices(retrieved_indices)
+            out = self.language_model(input_ids=input_ids, use_cache=True, past_key_values=self.kv_cache)
+            past_key_values = out.past_key_values  # Retrieved KV-Cache: L x 2 x (B, h, N, Dh)
+
+        for layer_kv in self.kv_cache:  # reset to default
+            layer_kv.reset_retrieval()
+
+        for i in range(max_new_tokens):
+            if i == 0:  # prefill
+                #input_ids = self.processor.tokenizer(input_text['prompt']).input_ids
+                #input_ids = torch.as_tensor([input_ids], device=device)
+                #inputs_embeds = self.get_input_embeddings()(input_ids)
+                #out = self.language_model(inputs_embeds=inputs_embeds, use_cache=True, past_key_values=past_key_values)
+                gen_inputs = self.processor(text=input_text['prompt'], images=image, return_tensors="pt")
+                gen_inputs = {k: v.to(device) for k, v in gen_inputs.items()}
+                out = self.language_model(**gen_inputs, use_cache=True, past_key_values=past_key_values)
+                
+                past_key_values = out.past_key_values
+                logits = out.logits
+            else:  # decoding
+                out = self.language_model(
+                    input_ids=torch.as_tensor(
+                        [[token]],
+                        device=device,
+                    ),
+                    use_cache=True,
+                    past_key_values=past_key_values,
+                )
+                logits = out.logits
+                past_key_values = out.past_key_values
+
+            last_token_logits = logits[0, -1, :]
+            
+            _, indices = torch.topk(last_token_logits, 2)
+            tokens = [int(index) for index in indices.tolist()]
+            token = tokens[0]
+
+            output_ids.append(token)
+
+            if token in stop_token_ids:
+                stopped = True
+            else:
+                stopped = False
+
+            if i == max_new_tokens - 1 or stopped:
+                break
+
+        output = self.processor.tokenizer.decode(
+            output_ids,
+            skip_special_tokens=True,
+            spaces_between_special_tokens=False,
+            clean_up_tokenization_spaces=True,
+        )
+        
+        return output
+
 def load_model(model_path='model_zoo/LLaVA/llava-onevision-qwen2-7b-ov-hf',
                n_init=None, n_local=None, topk=64, chunk_size=1):
     device = 'cuda'
