@@ -16,6 +16,14 @@ class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV)
         if mc:
             prompt += 'Best option: ('
         return prompt
+    
+    def get_choosing_prompt(self, query, options, mc = True):
+        options_str = "\n".join([f"{k}. {v}" for k, v in options.items()])
+        prompt = f"\n{query}\nOptions:\n{options_str}<|im_end|><|im_start|>assistant\n"
+        if mc:
+            prompt += 'Best option: ('
+        return prompt
+
 
     def _get_video_features(self, pixel_values_videos):
         batch_size, frames, channels, height, width = pixel_values_videos.shape
@@ -154,15 +162,9 @@ class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV)
                 if len(pixel_values.shape) == 4:
                     pixel_values = pixel_values.unsqueeze(0)
                 
-                # 提取图像特征
-                print(f"=== 图像特征处理调试 ===")
-                print(f"pixel_values shape: {pixel_values.shape}")
+
                 image_features = self._get_video_features(pixel_values)
-                print(f"image_features shape: {image_features.shape}")
-                print(f"每张图片的特征数量: {image_features.shape[1] // pixel_values.shape[1]}")
-                print(f"图像特征维度: {image_features.shape[2]}")
                 
-                # 2. 处理文本
                 text_inputs = self.processor.tokenizer(
                     input_text['prompt'], 
                     return_tensors="pt",
@@ -171,15 +173,7 @@ class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV)
                 
                 text_embeddings = self.get_input_embeddings()(text_inputs.input_ids)
                 
-
-
-                # 如果没有找到<image>标记，直接拼接
-                print(f"没有找到<image>标记，直接拼接")
-                print(f"image_features shape: {image_features.shape}")
-                print(f"text_embeddings shape: {text_embeddings.shape}")
                 final_embeddings = torch.cat([image_features, text_embeddings], dim=1)
-                print(f"直接拼接后: {final_embeddings.shape}")
-                
 
                 # 4. 传递给language_model
                 out = self.language_model(inputs_embeds=final_embeddings, use_cache=True, past_key_values=past_key_values)
@@ -205,11 +199,6 @@ class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV)
             token = tokens[0]
 
             output_ids.append(token)
-            
-            # 添加调试信息
-            if i < 5:  # 只打印前5个token
-                decoded_token = self.processor.tokenizer.decode([token])
-                print(f"Generated token {i}: {token} -> '{decoded_token}'")
 
             if token in stop_token_ids:
                 stopped = True

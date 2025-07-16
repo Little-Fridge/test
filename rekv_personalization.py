@@ -74,7 +74,7 @@ def get_last_retrieved_indices():
     """获取最后一次检索的索引"""
     return last_retrieved_indices
 
-def test_personalization(personalize_set,name, prompt, input_image, model_name="llava_ov_7b"):
+def test_personalization(personalize_set, qa, model_name="llava_ov_7b"):
     model_path = f'model_zoo/{model_name}'
     
     model, processor = llava_onevision_rekv.load_model(
@@ -89,9 +89,13 @@ def test_personalization(personalize_set,name, prompt, input_image, model_name="
     # 设置检索信息捕获（在kv_cache创建后）
     setup_retrieval_capture(model)
 
-    for name, content in personalize_set.items():
+    # 编码个性化数据集
+    print(f"===============编码个性化数据集===============")
+    print(f"Personalization pairs num: {len(personalize_set)}")
+    for name_, content in personalize_set.items():
+        print(f"encoding {name_}...")
         pair = {
-            "id": name,
+            "id": name_,
             "category": content['category'],
             "images": content["images"],
             "text": content['info']
@@ -99,28 +103,36 @@ def test_personalization(personalize_set,name, prompt, input_image, model_name="
         model.encode_personalized_pair(pair)
 
         memory_usage = model.calc_memory_usage() / (1024**3)
-        print(f"当前KV-Cache内存使用: {memory_usage:.2f} GB")
+        print(f"KV-Cache memory usage: {memory_usage:.2f} GB")
         
+    # 测试VQA
+    correct_num = 0
+    corrent_num = 0
+    for qa_ in qa:
+        input_text = {
+            "question": qa_['question'].replace('<sks>',qa_['name']),
+            "prompt": model.get_choosing_prompt(qa_['question'].replace('<sks>',qa_['name']),qa_['options'],mc=True)
+        }
         
-    input_text = {
-        "question": prompt.replace('<sks>',name),
-        "prompt": model.get_prompt(prompt.replace('<sks>',name))
-    }
-    
-    print(f"开始视觉问答...")
-    print(f"问题: {prompt}")
-    print(f"prompt: {model.get_prompt(prompt.replace('<sks>',name))}")
-    
-    answer = model.visual_question_answering(input_image, input_text, max_new_tokens=128)
-    
-    print(f"回答: {answer}")
-    
-    # 获取检索信息
-    retrieved_indices = get_last_retrieved_indices()
-    if retrieved_indices is not None:
-        print(f"检索到的块索引: {retrieved_indices}")
-    else:
-        print("未检索到相关信息")
+        print(f"===============VQA测试===============")
+        print(f"question: {input_text['question']}")
+        print(f"prompt: {input_text['prompt']}")
+        
+        answer = model.visual_question_answering(qa_['image'], input_text, max_new_tokens=128)
+        
+        print(f"回答: {answer}")
+        print(f"答案: {qa_['correct_answer']}")
+        if answer[0] == qa_['correct_answer']:
+            correct_num += 1
+        corrent_num += 1
+        print(f"correct_num: {correct_num}, corrent_num: {corrent_num}, accuracy: {correct_num/corrent_num}")
+        
+        # 获取检索信息
+        retrieved_indices = get_last_retrieved_indices()
+        if retrieved_indices is not None:
+            print(f"检索到的块索引: {retrieved_indices}")
+        else:
+            print("未检索到相关信息")
     
     return answer
 
@@ -134,11 +146,7 @@ if __name__ == "__main__":
     personalize_set = {}
     qa =[]
     # 测试前5个数据
-    i = 0
     for name in ds:
-        if i > 5:
-            break
-        i += 1
         personalize_set[name] = {}
         personalize_set[name]['category'] = None
         personalize_set[name]['info'] = None
@@ -151,7 +159,7 @@ if __name__ == "__main__":
             qa.append({
                 "name": name,
                 "question": ds[name][j]['question'],
-                "image": j,
+                "image": Image.open(j),
                 "options": ds[name][j]['options'],
                 "correct_answer": ds[name][j]['correct_answer']
             })
@@ -166,8 +174,6 @@ if __name__ == "__main__":
 
     test_personalization(
         personalize_set=personalize_set,
-        name=qa[0]['name'],
-        prompt=qa[0]['question'],
-        input_image=Image.open(qa[0]['image']),
+        qa=qa,
         model_name="LLaVA/llava-onevision-qwen2-7b-ov-hf"
     )
