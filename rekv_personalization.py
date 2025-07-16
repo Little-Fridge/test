@@ -74,7 +74,7 @@ def get_last_retrieved_indices():
     """获取最后一次检索的索引"""
     return last_retrieved_indices
 
-def test_personalization(personalize_set, prompt, input_image, model_name="llava_ov_7b"):
+def test_personalization(personalize_set,name, prompt, input_image, model_name="llava_ov_7b"):
     model_path = f'model_zoo/{model_name}'
     
     model, processor = llava_onevision_rekv.load_model(
@@ -103,21 +103,36 @@ def test_personalization(personalize_set, prompt, input_image, model_name="llava
         
         
     input_text = {
-        "question": prompt,
-        "prompt": model.get_prompt(prompt)
+        "question": prompt.replace('<sks>',name),
+        "prompt": model.get_prompt(prompt.replace('<sks>',name))
     }
+    
+    print(f"开始视觉问答...")
+    print(f"问题: {prompt}")
+    print(f"prompt: {model.get_prompt(prompt.replace('<sks>',name))}")
+    
     answer = model.visual_question_answering(input_image, input_text, max_new_tokens=128)
-
+    
+    print(f"回答: {answer}")
+    
+    # 获取检索信息
+    retrieved_indices = get_last_retrieved_indices()
+    if retrieved_indices is not None:
+        print(f"检索到的块索引: {retrieved_indices}")
+    else:
+        print("未检索到相关信息")
+    
+    return answer
 
 
 if __name__ == "__main__":
     
-    json_path = './YoLLaVA/yollava-visual-qa.json'
+    json_path = './yollava-data/yollava-visual-qa.json'
     ds =  json.loads(open(json_path).read())
 
     
     personalize_set = {}
-    
+    qa =[]
     # 测试前5个数据
     i = 0
     for name in ds:
@@ -128,18 +143,31 @@ if __name__ == "__main__":
         personalize_set[name]['category'] = None
         personalize_set[name]['info'] = None
         personalize_set[name]['images'] = []
-        for filename in os.listdir(f'./YoLLaVA/train/{name}'):
-            image_path = f'./YoLLaVA/train/{name}/{filename}'
+        for filename in os.listdir(f'./yollava-data/train/{name}'):
+            image_path = f'./yollava-data/train/{name}/{filename}'
             personalize_set[name]['images'].append(Image.open(image_path))
+
+        for j in ds[name]:
+            qa.append({
+                "name": name,
+                "question": ds[name][j]['question'],
+                "image": j,
+                "options": ds[name][j]['options'],
+                "correct_answer": ds[name][j]['correct_answer']
+            })
 
     print("个性化数据集已加载，包含以下项目:")
     for k, v in personalize_set.items():
         print(f"name: {k}, category: {v['category']}, info: {v['info']}, images num: {len(v['images'])}")
     print("图片已经加载，开始个性化测试...")
     
+    
+    
+
     test_personalization(
         personalize_set=personalize_set,
-        prompt="What is the car in the image?",
-        input_image="refcoco/crop/821_0.jpg",
+        name=qa[0]['name'],
+        prompt=qa[0]['question'],
+        input_image=Image.open(qa[0]['image']),
         model_name="LLaVA/llava-onevision-qwen2-7b-ov-hf"
     )

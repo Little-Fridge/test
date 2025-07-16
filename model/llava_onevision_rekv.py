@@ -136,13 +136,53 @@ class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV)
 
         for i in range(max_new_tokens):
             if i == 0:  # prefill
-                #input_ids = self.processor.tokenizer(input_text['prompt']).input_ids
-                #input_ids = torch.as_tensor([input_ids], device=device)
-                #inputs_embeds = self.get_input_embeddings()(input_ids)
-                #out = self.language_model(inputs_embeds=inputs_embeds, use_cache=True, past_key_values=past_key_values)
-                gen_inputs = self.processor(text=input_text['prompt'], images=image, return_tensors="pt")
-                gen_inputs = {k: v.to(device) for k, v in gen_inputs.items()}
-                out = self.language_model(**gen_inputs, use_cache=True, past_key_values=past_key_values)
+                # 分别处理图像和文本，类似encode_personalized_pair的实现
+                # 1. 处理图像特征
+                if isinstance(image, list):
+                    images = image
+                else:
+                    images = [image]
+                
+                # 使用image_processor单独处理图像
+                image_inputs = self.processor.image_processor(
+                    images=images,
+                    return_tensors="pt"
+                )
+                pixel_values = image_inputs['pixel_values'].to(self.device, self.dtype)
+                
+                # 格式化为类似视频的格式: (1, num_images, 3, H, W)
+                if len(pixel_values.shape) == 4:
+                    pixel_values = pixel_values.unsqueeze(0)
+                
+                # 提取图像特征
+                print(f"=== 图像特征处理调试 ===")
+                print(f"pixel_values shape: {pixel_values.shape}")
+                image_features = self._get_video_features(pixel_values)
+                print(f"image_features shape: {image_features.shape}")
+                print(f"每张图片的特征数量: {image_features.shape[1] // pixel_values.shape[1]}")
+                print(f"图像特征维度: {image_features.shape[2]}")
+                
+                # 2. 处理文本
+                text_inputs = self.processor.tokenizer(
+                    input_text['prompt'], 
+                    return_tensors="pt",
+                    add_special_tokens=False
+                ).to(self.device)
+                
+                text_embeddings = self.get_input_embeddings()(text_inputs.input_ids)
+                
+
+
+                # 如果没有找到<image>标记，直接拼接
+                print(f"没有找到<image>标记，直接拼接")
+                print(f"image_features shape: {image_features.shape}")
+                print(f"text_embeddings shape: {text_embeddings.shape}")
+                final_embeddings = torch.cat([image_features, text_embeddings], dim=1)
+                print(f"直接拼接后: {final_embeddings.shape}")
+                
+
+                # 4. 传递给language_model
+                out = self.language_model(inputs_embeds=final_embeddings, use_cache=True, past_key_values=past_key_values)
                 
                 past_key_values = out.past_key_values
                 logits = out.logits
@@ -165,9 +205,15 @@ class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV)
             token = tokens[0]
 
             output_ids.append(token)
+            
+            # 添加调试信息
+            if i < 5:  # 只打印前5个token
+                decoded_token = self.processor.tokenizer.decode([token])
+                print(f"Generated token {i}: {token} -> '{decoded_token}'")
 
             if token in stop_token_ids:
                 stopped = True
+                print(f"Stopped at token {i}, stop_token: {token}")
             else:
                 stopped = False
 
