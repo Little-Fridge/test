@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-简单的流式视频测试脚本
-用于测试一条流视频和一条prompt的ReKV功能
+用于测试yollava-text-qa数据集的个性化测试
 """
 
 import torch
@@ -105,7 +104,7 @@ def test_personalization(personalize_set, qa, model_name="llava_ov_7b"):
         memory_usage = model.calc_memory_usage() / (1024**3)
         print(f"KV-Cache memory usage: {memory_usage:.2f} GB")
         
-    # 测试VQA
+    # 测试text QA
     correct_num = 0
     corrent_num = 0
     for qa_ in qa:
@@ -118,8 +117,9 @@ def test_personalization(personalize_set, qa, model_name="llava_ov_7b"):
         print(f"question: {input_text['question']}")
         print(f"prompt: {input_text['prompt']}")
         
-        answer = model.visual_question_answering(qa_['image'], input_text, max_new_tokens=128)
-        
+        # answer = model.visual_question_answering(qa_['image'], input_text, max_new_tokens=128)
+        answer = model.question_answering(input_text, max_new_tokens=128)
+
         print(f"回答: {answer}")
         print(f"答案: {qa_['correct_answer']}")
         if answer[0] == qa_['correct_answer']:
@@ -139,13 +139,12 @@ def test_personalization(personalize_set, qa, model_name="llava_ov_7b"):
 
 if __name__ == "__main__":
     
-    json_path = './yollava-data/yollava-visual-qa.json'
+    json_path = './yollava-data/text_qa.json'
     ds =  json.loads(open(json_path).read())
 
     
     personalize_set = {}
     qa =[]
-    # 测试前5个数据
     for name in ds:
         personalize_set[name] = {}
         personalize_set[name]['category'] = None
@@ -159,8 +158,8 @@ if __name__ == "__main__":
             qa.append({
                 "name": name,
                 "question": ds[name][j]['question'],
-                "image": Image.open(j),
-                "options": ds[name][j]['options'],
+                "number": j,
+                "options": ds[name][j]['option'],
                 "correct_answer": ds[name][j]['correct_answer']
             })
 
