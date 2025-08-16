@@ -52,42 +52,6 @@ def setup_retrieval_capture(model):
 def get_last_retrieved_indices():
     return last_retrieved_indices
 
-# ==== 新增：调试打印与启用性检查 ====
-
-def debug_dump_pairs(model, title=""):
-    """逐层打印已登记的个性化 pair 与对应block数量，用于确认个性化对齐已开启"""
-    if title:
-        print(f"\n===== {title} =====")
-    if not hasattr(model, "kv_cache") or model.kv_cache is None:
-        print("[DEBUG] 模型尚未创建 kv_cache。")
-        return
-
-    for li, layer_kv in enumerate(model.kv_cache):
-        pairs = getattr(layer_kv, "pairs", {})
-        if not isinstance(pairs, dict):
-            print(f"[L{li:02d}] pairs 类型异常：{type(pairs)}")
-            continue
-        if len(pairs) == 0:
-            print(f"[L{li:02d}] 尚未登记任何个性化 pair")
-            continue
-        print(f"[L{li:02d}] 已登记 {len(pairs)} 个 pair：")
-        for pid, meta in pairs.items():
-            blocks = meta.get("blocks", [])
-            print(f"  - pair_id='{pid}', blocks={len(blocks)}")
-
-def is_personalization_enabled(model):
-    """至少有一层登记了至少一个pair，即视为开启"""
-    if not hasattr(model, "kv_cache") or model.kv_cache is None:
-        return False
-    for layer_kv in model.kv_cache:
-        pairs = getattr(layer_kv, "pairs", {})
-        if isinstance(pairs, dict) and len(pairs) > 0:
-            return True
-    return False
-
-# ==== 新增结束 ====
-
-
 def test_personalization(personalize_set, qa, model_name):
     """主测试流程：注入 KV，跑 text-qa，多选接口"""
     model, processor = llava_onevision_rekv.load_model(
@@ -111,8 +75,6 @@ def test_personalization(personalize_set, qa, model_name):
         }
         model.encode_personalized_pair(pair)
         print(f"  KV-Cache 使用内存: {model.calc_memory_usage()/(1024**3):.2f} GB")
-        # 新增：每个 pair 编码后立即打印登记情况
-        debug_dump_pairs(model, title=f"PAIR '{name_}' 登记结果")
     torch.cuda.synchronize()
 
     # 兜底重编码无块的 pair
@@ -130,11 +92,6 @@ def test_personalization(personalize_set, qa, model_name):
                     "text": content['info']
                 })
             torch.cuda.synchronize()
-
-    # 编码完所有 pair 后再整体检查一次
-    debug_dump_pairs(model, title="全部PAIR登记汇总")
-    if not is_personalization_enabled(model):
-        print("[ERROR] 未检测到任何层登记个性化 pair —— 将退回普通 Top-k 检索路径。请检查 encode_personalized_pair 是否被调用以及块是否成功 materialize。")
 
     print("\n=== VQA 多选测试 ===")
     correct, total = 0, 0
@@ -166,7 +123,7 @@ def test_personalization(personalize_set, qa, model_name):
 
     print(f"\n=== Final Accuracy: {correct}/{total} = {correct/total:.3f} ===")
 
-    # 新增：输出每个概念的准确率
+    # 新增：输出每个 concept 的准确率
     print("\n=== 每个概念的准确率 ===")
     # 为了保持稳定顺序，按名称排序输出
     for name in sorted(per_concept.keys()):
@@ -199,7 +156,7 @@ def main():
         }
 
     # 2) 直接读取已生成的 infos.json
-    infos_path = "infos.json"
+    infos_path = "/home/ubuntu/ken/ReKV/infos.json"
     info_map = json.load(open(infos_path, encoding="utf-8"))
     logging.info(f"[INFO] 从 {infos_path} 读取到 {len(info_map)} 条描述")
 
