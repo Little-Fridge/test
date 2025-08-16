@@ -1,286 +1,366 @@
+# -*- coding: utf-8 -*-
+from typing import List, Dict, Any, Set
 import torch
-from logzero import logger
+from torch import nn
 
 
-class Abstract_ReKV:
+class Abstract_ReKV(nn.Module):
     """
-    抽象基类（mixin）：
-    - 负责通用的 KV 管理、init prompt 编码、个性化 pair 编码（图像 + 文本）
-    - 视觉特征提取 _get_video_features() 由子类实现（返回形如 (1, F*196, D)）
-    - 具体的 QA / VQA / REC 逻辑由子类实现
+    轻量版 ReKV 抽象基类：
+    - 允许被无参初始化（兼容 HF 的 super() 构造链）
+    - 提供 encode_init_prompt / encode_personalized_pair
+    - 仅保留“全局图”一帧；与子类 _get_video_features 配合
+    - 提供 clear_cache / get_cache / _get_cache / calc_memory_usage
     """
-
-    processor = None
-    kv_cache = None
-
-    def __init__(self, processor, n_frame_tokens, init_prompt_ids, n_local, topk, chunk_size):
+    def __init__(
+        self,
+        language_model: nn.Module = None,
+        vision_tower: nn.Module = None,
+        processor: Any = None,
+    ):
+        super().__init__()
+        self.language_model = language_model
+        self.vision_tower = vision_tower
         self.processor = processor
-        self.n_frame_tokens = int(n_frame_tokens)
-        self.init_prompt_ids = init_prompt_ids  # 支持 None / str / list[int] / (L,) or (1,L) Tensor
-        self.n_local = int(n_local)
-        self.topk = int(topk)
-        self.chunk_size = int(chunk_size)
 
-    # -------------------- device / dtype / embeddings --------------------
+        # KV 缓存（HF past_key_values 的兼容容器）
+        self.kv_cache = None
+        self.debug = False
+
+    # ---------------- 便捷属性 ----------------
     @property
     def device(self):
         try:
             return next(self.parameters()).device
         except StopIteration:
-            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            return torch.device("cpu")
 
     @property
     def dtype(self):
         try:
             return next(self.parameters()).dtype
         except StopIteration:
-            return torch.float16 if torch.cuda.is_available() else torch.float32
+            return torch.float16
 
     def get_input_embeddings(self):
-        return self.language_model.get_input_embeddings()
+        if self.language_model is None:
+            raise RuntimeError("language_model 未初始化，无法获取嵌入层。")
+        if hasattr(self.language_model, "get_input_embeddings"):
+            return self.language_model.get_input_embeddings()
+        raise RuntimeError("language_model 不支持 get_input_embeddings()。")
 
-    # -------------------- cache utils --------------------
-    def clear_cache(self):
-        self.kv_cache = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+    # --------------- Prompt helpers ---------------
+    def get_choosing_prompt(
+        self,
+        question: str,
+        options: List[str],
+        mc: bool = True,
+        add_image_token: bool = False,
+    ) -> str:
+        """
+        生成多选/单选题提示词。
+        - question: 题干
+        - options : 选项列表，如 ["cat", "dog", "bird"]
+        - mc      : True 表示单选(single-choice)；False 表示多选(multi-select)
+        - add_image_token: 是否在最前面加上 <image> 占位符（默认为 False，
+                           因为你的评测是先做个性化编码，然后仅用文本问答）
+        返回：一段纯文本 prompt
+        """
+        letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        n = len(options)
+        if n == 0:
+            raise ValueError("options 不能为空")
+        if n > len(letters):
+            raise ValueError(f"选项过多：{n}，最多支持 {len(letters)} 个")
 
-    # -------------------- init-prompt 编码（稳健版） --------------------
+        lines = []
+        if add_image_token:
+            lines.append("<image>")
+        lines.append("You are a helpful visual question answering assistant.")
+        lines.append(f"Question: {question}")
+        lines.append("Options:")
+        for i, opt in enumerate(options):
+            lines.append(f"{letters[i]}. {opt}")
+
+        if mc:
+            lines.append("Answer with the single letter only (e.g., 'A').")
+        else:
+            lines.append("Answer with all correct letters, comma-separated (e.g., 'A,C').")
+
+        return "\n".join(lines)
+
+
+    # --------------- KV 相关：公共 API ---------------
+    def clear_cache(self, keep_global: bool = False):
+        """
+        清理 KV 缓存。
+        keep_global=False: 彻底清空（最常用）
+        keep_global=True : 只清局部块，尽量保留全局块（若底层实现了接口）
+        """
+        if self.kv_cache is None:
+            return
+
+        for layer_kv in self.kv_cache:
+            try:
+                if keep_global:
+                    if hasattr(layer_kv, "clear_local"):
+                        layer_kv.clear_local()
+                    elif hasattr(layer_kv, "reset_local"):
+                        layer_kv.reset_local()
+                    elif hasattr(layer_kv, "clear_except_global"):
+                        layer_kv.clear_except_global()
+                else:
+                    if hasattr(layer_kv, "clear"):
+                        layer_kv.clear()
+                    elif hasattr(layer_kv, "reset"):
+                        layer_kv.reset()
+                    elif hasattr(layer_kv, "clear_all"):
+                        layer_kv.clear_all()
+            except Exception:
+                pass
+
+        if not keep_global:
+            self.kv_cache = None
+
+    def get_cache(self):
+        return self.kv_cache
+
+    def _get_cache(self):
+        return self.kv_cache
+
+    def calc_memory_usage(self, include_model: bool = False) -> int:
+        """
+        估算内存占用（单位：字节）。默认仅统计 KV 缓存；如需连同模型权重一起统计，设 include_model=True。
+
+        注意：这是按张量 numel()*element_size() 粗略估计，
+        与实际显存（分配/碎片/缓存）可能有差异。
+        """
+        def tensor_bytes(t: torch.Tensor) -> int:
+            try:
+                return t.numel() * t.element_size()
+            except Exception:
+                return 0
+
+        seen: Set[int] = set()
+
+        def walk_bytes(obj) -> int:
+            oid = id(obj)
+            if oid in seen:
+                return 0
+            seen.add(oid)
+
+            # 张量
+            if torch.is_tensor(obj):
+                return tensor_bytes(obj)
+
+            # HF 标准 past_key_values: tuple(tuple(Tensor, Tensor), ...)
+            if isinstance(obj, (list, tuple)):
+                s = 0
+                for x in obj:
+                    s += walk_bytes(x)
+                return s
+
+            # 字典
+            if isinstance(obj, dict):
+                s = 0
+                for v in obj.values():
+                    s += walk_bytes(v)
+                return s
+
+            # 自定义 KV 管理器对象：遍历 __dict__
+            if hasattr(obj, "__dict__"):
+                s = 0
+                for v in obj.__dict__.values():
+                    s += walk_bytes(v)
+                return s
+
+            return 0
+
+        total = 0
+
+        # 1) KV 缓存
+        if self.kv_cache is not None:
+            total += walk_bytes(self.kv_cache)
+
+        # 2) 模型权重（可选）
+        if include_model:
+            try:
+                for p in self.parameters():
+                    total += tensor_bytes(p.data)
+                for b in self.buffers():
+                    total += tensor_bytes(b.data if hasattr(b, "data") else b)
+            except Exception:
+                pass
+
+        return total
+
+    # --------------- 初始化提示编码（可选） ---------------
     @torch.inference_mode()
     def encode_init_prompt(self):
         """
-        将 self.init_prompt_ids 规范化为 (1, L) 的 LongTensor。
-        - None / 空 → 设为 (1,0) 空张量，n_init=0，直接返回（不做前向）
-        - str       → tokenizer.encode → (1, L)
-        - list/tuple→ as_tensor → (1, L)
-        - Tensor    → (L,) → (1, L)；(1, L) 保持
-        最终仅当 L>0 时才执行 language_model 前向并写入 kv_cache。
+        假设外部已设置 self.init_prompt_ids (1, S)，用于先行写入 KV。
+        没有就跳过。
         """
-        dev = self.device
+        if getattr(self, "init_prompt_ids", None) is None:
+            if self.debug:
+                print("[init_prompt] 无 init_prompt_ids，跳过。")
+            return
 
-        def _set_empty_and_return():
-            self.n_init = 0
-            self.init_prompt_ids = torch.empty((1, 0), dtype=torch.long, device=dev)
-            logger.debug("[init_prompt] empty (skip forward)")
-            return self.kv_cache
+        if self.language_model is None:
+            raise RuntimeError("language_model 未初始化。")
 
-        x = self.init_prompt_ids
-
-        # 1) None / 空：优雅短路
-        if x is None:
-            return _set_empty_and_return()
-        if isinstance(x, (list, tuple)) and len(x) == 0:
-            return _set_empty_and_return()
-        if torch.is_tensor(x) and x.numel() == 0:
-            return _set_empty_and_return()
-        if isinstance(x, str) and len(x.strip()) == 0:
-            return _set_empty_and_return()
-
-        # 2) 规范成 2D (1, L)
-        if isinstance(x, str):
-            tok = getattr(getattr(self, "processor", None), "tokenizer", None)
-            if tok is None:
-                return _set_empty_and_return()
-            ids = tok.encode(x, add_special_tokens=False)
-            ids = torch.as_tensor(ids, dtype=torch.long, device=dev).unsqueeze(0)  # (1, L)
-        elif torch.is_tensor(x):
-            ids = x.to(device=dev, dtype=torch.long)
-            if ids.dim() == 1:
-                ids = ids.unsqueeze(0)  # (1, L)
-            elif ids.dim() == 2:
-                pass
-            else:
-                raise ValueError(f"[init_prompt] tensor dim must be 1 or 2, got {ids.shape}")
-        else:
-            # 视作可迭代的 token id 列表
-            ids = torch.as_tensor(x, dtype=torch.long, device=dev)
-            if ids.dim() == 1:
-                ids = ids.unsqueeze(0)  # (1, L)
-            elif ids.dim() != 2:
-                ids = ids.view(1, -1)
-
-        L = int(ids.size(-1))
-        self.init_prompt_ids = ids
-        self.n_init = L
-
-        if L == 0:
-            return _set_empty_and_return()
-
-        # 3) 正式前向（input_ids 必须为 2D）
-        logger.debug(f"[init_prompt] forward with length={L}")
-        output = self.language_model(input_ids=self.init_prompt_ids, use_cache=True, return_dict=True)
+        input_ids = self.init_prompt_ids.to(self.device)
+        output = self.language_model(input_ids=input_ids, use_cache=True, return_dict=True)
         self.kv_cache = output.past_key_values
-        return self.kv_cache
+        if self.debug:
+            print(f"[init_prompt] forward with length={input_ids.shape[1]}")
 
-    # -------------------- 视觉特征提取（由子类实现） --------------------
-    def _get_video_features(self, pixel_values_videos):
-        """
-        子类需要实现：
-        输入：pixel_values_videos, 形如 (B=1, F, 3, H, W)
-        输出：video_features, 形如 (1, F*196, D)
-        """
-        raise NotImplementedError
-
-    # -------------------- 将视频分块编码进 KV（通用） --------------------
-    def _encode_video_chunk(self, video_chunk):
-        """
-        video_chunk: (Nv, H, W, 3) numpy/array-like
-        使用 processor.video_processor → pixel_values_videos: (1, Nv, 3, H, W)
-        然后 _get_video_features → (1, Nv*196, D) → 送入 LLM 以累计 KV。
-        """
-        batch = self.processor.video_processor(videos=[video_chunk], return_tensors="pt")
-        pixel_values_videos = batch.get("pixel_values", batch)
-        pixel_values_videos = pixel_values_videos.to(self.device, self.dtype)  # (1, Nv, 3, H, W)
-
-        video_features = self._get_video_features(pixel_values_videos)  # (1, Nv*196, D)
-        assert self.n_local >= video_features.shape[1], \
-            f"n_local: {self.n_local}, video_features: {video_features.shape[1]}"
-
-        output = self.language_model(
-            inputs_embeds=video_features,
-            past_key_values=self.kv_cache,
-            use_cache=True,
-            return_dict=True
-        )
-        self.kv_cache = output.past_key_values
-
+    # --------------- 个性化对（只保留全局图） ---------------
     @torch.inference_mode()
-    def encode_video(self, video, encode_chunk_size=64):
-        """
-        video: (Nv, H, W, 3)
-        分块送入，逐块累计 KV。
-        """
-        num_frames = int(video.shape[0])
-        num_chunks = num_frames // encode_chunk_size
-
-        for chunk_idx in range(num_chunks):
-            st = chunk_idx * encode_chunk_size
-            ed = st + encode_chunk_size
-            chunk_video = video[st:ed]
-            self._encode_video_chunk(chunk_video)
-
-        if num_frames % encode_chunk_size != 0:
-            self._encode_video_chunk(video[num_chunks * encode_chunk_size:])
-
-        return self.kv_cache
-
-    # -------------------- 个性化 pair 编码（图像 + 文本，训练对齐版） --------------------
-    @torch.inference_mode()
-    def encode_personalized_pair(self, pair):
+    def encode_personalized_pair(self, pair: Dict[str, Any]):
         """
         pair = {
-            "id": name,
-            "category": category,
-            "images": [PIL.Image or ndarray ...] or single image,
-            "text": text
+            "id": <name>,
+            "category": <str 或空>,
+            "images": [PIL.Image 或 ndarray ...] 或 单张,
+            "text": <str 或空>
         }
 
-        生成 prompt：
+        Prompt:
             <image>
-            Name: <id>
+            This image shows: <id>
             [Category: <category>]
             [Description: <text>]
-        并将 <image> 替换为图像特征；若无 <image> token，则按 [image_features, text_embeddings] 拼接。
+
+        仅保留“全局图”：如果拿到 (N, F, 3, H, W) 就裁到 F=1（取第一个裁剪）。
         """
-        # ---------- 1) 拼文本 ----------
+        if self.processor is None:
+            raise RuntimeError("processor 未初始化。")
+        if self.language_model is None:
+            raise RuntimeError("language_model 未初始化。")
+        if not hasattr(self, "_get_video_features"):
+            raise RuntimeError("模型未实现 _get_video_features()。")
+
+        # 1) 文本 prompt
         id_ = pair["id"]
-        category = pair.get("category", "")
-        description = pair.get("text", "")
+        category = pair.get("category") or ""
+        description = pair.get("text") or ""
 
-        optional = ""
+        opt_lines = []
         if category:
-            optional += f"\nCategory: {category}"
+            opt_lines.append(f"Category: {category}")
         if description:
-            optional += f"\nDescription: {description}"
+            opt_lines.append(f"Description: {description}")
+        opt_text = ("\n" + "\n".join(opt_lines)) if opt_lines else ""
 
-        if isinstance(pair.get("images", []), list) and len(pair["images"]) > 1:
-            prompt = f"<image>\nThese {len(pair['images'])} images show the personalized content: {id_}{optional}"
+        prompt = f"<image>\nThis image shows: {id_}{opt_text}"
+
+        # 2) 只保留全局图（多张取第一张）
+        imgs = pair.get("images", [])
+        if isinstance(imgs, list):
+            img0 = imgs[0] if len(imgs) > 0 else None
         else:
-            prompt = f"<image>\nThis image shows: {id_}{optional}"
+            img0 = imgs
+        if img0 is None:
+            raise RuntimeError(f"pair {id_} 未提供图片。")
 
-        # ---------- 2) 图像 → feature ----------
-        images = pair["images"] if isinstance(pair.get("images", []), list) else [pair["images"]]
-        image_inputs = self.processor.image_processor(images=images, return_tensors="pt")
-        pixel_values = image_inputs["pixel_values"].to(self.device, self.dtype)  # (N, 3, H, W)
+        image_inputs = self.processor.image_processor(images=[img0], return_tensors="pt")
 
-        # 期望下游 _get_video_features 输入为 (1, F, 3, H, W)
-        if pixel_values.dim() == 4:  # (N, 3, H, W)
-            pixel_values = pixel_values.unsqueeze(0)  # (1, N, 3, H, W)
+        # 有的处理器返回 "pixel_values"，有的返回 "pixel_values_videos"
+        pixel_values = image_inputs.get("pixel_values", None)
+        if pixel_values is None:
+            pixel_values = image_inputs.get("pixel_values_videos", None)
+        if pixel_values is None:
+            raise RuntimeError("image_processor 未返回 pixel_values。")
 
-        image_features = self._get_video_features(pixel_values)  # (1, N*196, D)
-        if image_features.dtype != self.dtype:
-            image_features = image_features.to(self.dtype)
+        # 对齐到视觉塔 device/dtype，避免 Float/Half 冲突
+        vt = getattr(self, "vision_tower", None)
+        if vt is None:
+            raise RuntimeError("vision_tower 未初始化。")
+        try:
+            vt_param = next(vt.parameters())
+            pixel_values = pixel_values.to(device=vt_param.device, dtype=vt_param.dtype)
+        except StopIteration:
+            pass
 
-        # ---------- 3) 文本 → embeddings ----------
-        text_inputs = self.processor.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
-        text_inputs = {k: v.to(self.device) for k, v in text_inputs.items()}
-        text_embeddings = self.get_input_embeddings()(text_inputs["input_ids"])  # (1, S, D)
-        if text_embeddings.dtype != self.dtype:
-            text_embeddings = text_embeddings.to(self.dtype)
+        # 期望 _get_video_features 输入为 (1, F, 3, H, W)
+        # 兼容三种情况： (N,3,H,W) / (N,F,3,H,W) / (N,1,F,3,H,W)
+        if pixel_values.dim() == 4:
+            # (N,3,H,W) -> (N,1,3,H,W)
+            pixel_values_5d = pixel_values.unsqueeze(1)
+        elif pixel_values.dim() == 5:
+            # (N,F,3,H,W) -> 只取全局 F=1
+            pixel_values_5d = pixel_values[:, :1, ...]
+        elif pixel_values.dim() == 6:
+            # (N,1,F,3,H,W) 之类的误加一维 -> 压回 (N,F,3,H,W) 再取 F=1
+            pixel_values_5d = pixel_values[:, 0, :1, ...]
+        else:
+            raise RuntimeError(f"不支持的 pixel_values 形状: {pixel_values.shape}")
 
-        # ---------- 4) 将 <image> token 替换为图像特征 ----------
-        image_token_id = self.processor.tokenizer.convert_tokens_to_ids("<image>")
+        # 3) 视觉特征：输出 (1, 196, D_lang)
+        image_features = self._get_video_features(pixel_values_5d)
+        lm_param = next(self.language_model.parameters())
+        image_features = image_features.to(device=lm_param.device, dtype=lm_param.dtype)
+
+        # 4) 文本 → embedding
+        tok = self.processor.tokenizer
+        text_inputs = tok(prompt, return_tensors="pt", add_special_tokens=False)
+        text_inputs = {k: v.to(lm_param.device) for k, v in text_inputs.items()}
+
+        text_emb = self.get_input_embeddings()(text_inputs["input_ids"])  # (1, S, D_lang)
+        if text_emb.dtype != lm_param.dtype:
+            text_emb = text_emb.to(lm_param.dtype)
+
+        # 5) 用 <image> 占位替换；没有就 [图像, 文本] 拼接
+        image_token_id = tok.convert_tokens_to_ids("<image>")
         input_ids_1d = text_inputs["input_ids"][0]  # (S,)
         try:
-            image_positions = (input_ids_1d == image_token_id).nonzero(as_tuple=True)[0] \
-                if image_token_id is not None else torch.empty(0, dtype=torch.long, device=self.device)
+            if image_token_id is not None:
+                image_pos = (input_ids_1d == image_token_id).nonzero(as_tuple=True)[0]
+            else:
+                image_pos = torch.empty(0, dtype=torch.long, device=lm_param.device)
         except Exception:
-            image_positions = torch.empty(0, dtype=torch.long, device=self.device)
+            image_pos = torch.empty(0, dtype=torch.long, device=lm_param.device)
 
-        if image_positions.numel() > 0:
-            final_embeddings_list = []
-            last_pos = 0
-            for img_pos in image_positions.tolist():
-                if img_pos > last_pos:
-                    final_embeddings_list.append(text_embeddings[0, last_pos:img_pos])  # 文本片段
-                final_embeddings_list.append(image_features[0])  # (N*196, D)
-                last_pos = img_pos + 1
-            if last_pos < text_embeddings.shape[1]:
-                final_embeddings_list.append(text_embeddings[0, last_pos:])
-            final_embeddings = torch.cat(final_embeddings_list, dim=0).unsqueeze(0)  # (1, *, D)
+        if image_pos.numel() > 0:
+            parts: List[torch.Tensor] = []
+            last = 0
+            for pos in image_pos.tolist():
+                if pos > last:
+                    parts.append(text_emb[:, last:pos, :])  # 文本片段
+                parts.append(image_features)                 # (1, 196, D)
+                last = pos + 1
+            if last < text_emb.shape[1]:
+                parts.append(text_emb[:, last:, :])
+            final_embeddings = torch.cat(parts, dim=1).contiguous()  # (1, *, D)
         else:
-            # 若 tokenizer 不含 <image>，保持与训练一致：图像特征在前
-            final_embeddings = torch.cat([image_features, text_embeddings], dim=1)
+            final_embeddings = torch.cat([image_features, text_emb], dim=1).contiguous()
 
-        # ---------- 5) pair lifecycle：让 KV 知道当前是在写哪个 concept ----------
+        # 6) life-cycle hooks（如果 KV 管理器实现了）
         if self.kv_cache is not None:
             for layer_kv in self.kv_cache:
                 if hasattr(layer_kv, "set_current_encoding_pair"):
-                    layer_kv.set_current_encoding_pair(id_, image_features, text_embeddings)
+                    try:
+                        layer_kv.set_current_encoding_pair(id_, image_features, text_emb)
+                    except Exception:
+                        pass
 
-        # ---------- 6) 推入模型，累计 KV ----------
-        output = self.language_model(
+        # 7) 推入 LM，累计 KV
+        out = self.language_model(
             inputs_embeds=final_embeddings,
             past_key_values=self.kv_cache,
             use_cache=True,
-            return_dict=True
+            return_dict=True,
         )
-        self.kv_cache = output.past_key_values
+        self.kv_cache = out.past_key_values
 
-        # 写回 blocks → concept 的映射
+        # 8) finalize hook
         if self.kv_cache is not None:
             for layer_kv in self.kv_cache:
                 if hasattr(layer_kv, "finalize_current_pair"):
-                    layer_kv.finalize_current_pair()
+                    try:
+                        layer_kv.finalize_current_pair()
+                    except Exception:
+                        pass
 
         return self.kv_cache
-
-    # -------------------- 预留接口：由子类实现 --------------------
-    @torch.inference_mode()
-    def question_answering(self, input_text, max_new_tokens=128):
-        raise NotImplementedError
-
-    # -------------------- KV 内存估算 --------------------
-    def calc_memory_usage(self):
-        if self.kv_cache is None:
-            return 0
-        if isinstance(self.kv_cache, (list, tuple)) and len(self.kv_cache) == 0:
-            return 0
-        try:
-            n_layers = len(self.kv_cache)
-            memory = n_layers * self.kv_cache[0].calculate_cpu_memory()
-            return memory
-        except Exception:
-            # 若实现方没有 calculate_cpu_memory，可自定义估算或返回 0
-            return 0

@@ -1,169 +1,207 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-用于测试yollava-visual-qa数据集的个性化测试
+用于测试 yollava-visual-qa 数据集的个性化测试（切片→分块→检索）
 """
+
+import json
+import os
+import sys
+from typing import Any, Dict
 
 import torch
-import argparse
-import json
-import sys
-import os
-from pathlib import Path
-import types
-
-# 添加项目根目录到Python路径
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from model import llava_onevision_rekv
-from decord import VideoReader, cpu
-import numpy as np
 from PIL import Image
 
-'''
-personalize_set = {"sks": 
-    {
-    "images": [PIL.Image.Image],
-    "info": "A close-up of a vintage car's front bumper.",
-    "category": "car"
-    }
-}
-'''
+# 添加项目根目录到 Python 路径
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from model import llava_onevision_rekv  # noqa: E402
 
-# 用于保存检索信息的全局变量
+# ---------------- 全局：用于保存检索信息（兼容旧方式） ----------------
 last_retrieved_indices = None
 
 
 def setup_retrieval_capture(model):
-    """设置检索信息捕获"""
+    """旧方式：wrap reset_retrieval，在 reset 前抓取命中块。"""
     global last_retrieved_indices
     last_retrieved_indices = None
-    
-    # 检查kv_cache是否已创建
-    if not hasattr(model, 'kv_cache') or model.kv_cache is None:
+
+    if not hasattr(model, "kv_cache") or model.kv_cache is None:
         print("警告: kv_cache未创建，无法设置检索信息捕获")
         return
-    
-    # 对每个层的KV cache进行monkey patching
+
     for i, layer_kv in enumerate(model.kv_cache):
-        if hasattr(layer_kv, 'reset_retrieval'):
-            # 保存原始方法
+        if hasattr(layer_kv, "reset_retrieval"):
             original_reset = layer_kv.reset_retrieval
-            
-            # 创建包装函数
+
             def make_wrapped_reset(original_func, kv_layer):
                 def wrapped_reset():
                     global last_retrieved_indices
-                    # 在重置之前保存检索信息
-                    if hasattr(kv_layer, 'retrieved_block_indices') and kv_layer.retrieved_block_indices is not None:
-                        if isinstance(kv_layer.retrieved_block_indices, list):
-                            last_retrieved_indices = [idx.copy() if isinstance(idx, list) else idx for idx in kv_layer.retrieved_block_indices]
-                        else:
-                            last_retrieved_indices = kv_layer.retrieved_block_indices
-                    else:
-                        last_retrieved_indices = None
-                    # 调用原始的reset_retrieval方法
+                    grab = None
+                    for attr in (
+                        "retrieved_block_indices",
+                        "last_retrieved",
+                        "debug_last_indices",
+                        "retrieved_indices",
+                    ):
+                        if hasattr(kv_layer, attr) and getattr(kv_layer, attr) is not None:
+                            grab = getattr(kv_layer, attr)
+                            break
+                    last_retrieved_indices = grab
                     return original_func()
+
                 return wrapped_reset
-            
-            # 替换方法
+
             layer_kv.reset_retrieval = make_wrapped_reset(original_reset, layer_kv)
 
 
-def get_last_retrieved_indices():
-    """获取最后一次检索的索引"""
+def get_last_retrieved_indices(model=None):
+    """优先用新接口读；没有再退回旧缓存。"""
+    if model is not None and hasattr(model, "get_debug_retrieved_indices"):
+        hits = model.get_debug_retrieved_indices()
+        if hits is not None:
+            return hits
     return last_retrieved_indices
 
-def test_personalization(personalize_set, qa, model_name="llava_ov_7b"):
-    model_path = f'model_zoo/{model_name}'
-    
+
+def _tensor_bytes_any(x: Any) -> int:
+    if torch.is_tensor(x):
+        return x.numel() * x.element_size()
+    if isinstance(x, (list, tuple)):
+        return sum(_tensor_bytes_any(t) for t in x)
+    if isinstance(x, dict):
+        return sum(_tensor_bytes_any(v) for v in x.values())
+    # 尝试对象属性（如果有 __dict__）
+    try:
+        return sum(_tensor_bytes_any(v) for v in vars(x).values())
+    except Exception:
+        return 0
+
+
+def get_kv_cache_gb(model) -> float:
+    total = 0
+    if hasattr(model, "kv_cache") and model.kv_cache is not None:
+        for layer in model.kv_cache:
+            total += _tensor_bytes_any(layer)
+    return total / (1024 ** 3)
+
+
+def test_personalization(personalize_set: Dict, qa: list):
+    model_path = "model_zoo/LLaVA/llava-onevision-qwen2-7b-ov-hf"
+
     model, processor = llava_onevision_rekv.load_model(
         model_path=model_path,
-        n_local=4000,    # 本地窗口大小
-        topk=8,          # 检索块数
-        chunk_size=1     # 块大小
+        n_local=4096,     # 本地窗口
+        topk=8,           # 每层检索块数
+        chunk_size=1,     # 1块=1切片×196token
+        block_size=196,   # 保持和上面一致
+        only_global=False # 使用多切片（例如21）
     )
 
-    model.clear_cache()
-    model.encode_init_prompt()
-    # 设置检索信息捕获（在kv_cache创建后）
+    # ---- 启用检索（非常关键） ----
+    # 你的 Abstract_ReKV 里一般以这些属性开关检索；这里显式打开以防默认关闭
+    setattr(model, "fattn", True)            # 打开检索注意力（你的项目里一般这样命名）
+    if getattr(model, "topk", 0) <= 0:
+        setattr(model, "topk", 8)
+    if not hasattr(model, "n_local"):
+        setattr(model, "n_local", 4096)
+    if not hasattr(model, "chunk_size"):
+        setattr(model, "chunk_size", 1)
+
+    # 清空并创建 KV 结构
+    if hasattr(model, "clear_cache"):
+        model.clear_cache()
+    if hasattr(model, "_get_cache"):
+        model._get_cache()
+
+    # 可选：初始化提示
+    if hasattr(model, "encode_init_prompt"):
+        model.encode_init_prompt()
+
+    # 旧式抓取挂钩（保底）
     setup_retrieval_capture(model)
 
     # 编码个性化数据集
-    print(f"===============编码个性化数据集===============")
+    print("===============编码个性化数据集===============")
     print(f"Personalization pairs num: {len(personalize_set)}")
     for name_, content in personalize_set.items():
         print(f"encoding {name_}...")
         pair = {
             "id": name_,
-            "category": content['category'],
-            "images": content["images"],
-            "text": content['info']
+            "category": content["category"],
+            "images": content["images"],  # List[PIL.Image.Image]
+            "text": content["info"],
         }
         model.encode_personalized_pair(pair)
 
-        memory_usage = model.calc_memory_usage() / (1024**3)
+        memory_usage = get_kv_cache_gb(model)
         print(f"KV-Cache memory usage: {memory_usage:.2f} GB")
-        
-    # 测试VQA
+
+    # VQA
     correct_num = 0
     corrent_num = 0
     for qa_ in qa:
-        input_text = {
-            "question": qa_['question'].replace('<sks>',qa_['name']),
-            "prompt": model.get_choosing_prompt(qa_['question'].replace('<sks>',qa_['name']),qa_['options'],mc=True)
-        }
-        
-        print(f"===============VQA测试===============")
-        print(f"question: {input_text['question']}")
-        print(f"prompt: {input_text['prompt']}")
-        
-        answer = model.visual_question_answering(qa_['image'], input_text, max_new_tokens=128)
-        
-        print(f"回答: {answer}")
+        q_text = qa_["question"].replace("<sks>", qa_["name"])
+        prompt = model.get_choosing_prompt(q_text, qa_["options"], mc=True)
+
+        print("===============VQA测试===============")
+        print(f"question: {q_text}")
+        print(f"prompt: {prompt}")
+
+        # 生成
+        ans_text = model.visual_question_answering(
+            qa_["image"], prompt, max_new_tokens=64, do_sample=False, temperature=None
+        ).strip()
+
+        # 只取第一个大写字母当作选项
+        pred = ""
+        for ch in ans_text:
+            if ch.upper() in ("A", "B", "C", "D"):
+                pred = ch.upper()
+                break
+
+        print(f"回答: {pred}  原始: {ans_text}")
         print(f"答案: {qa_['correct_answer']}")
-        if answer[0] == qa_['correct_answer']:
+        if pred == str(qa_["correct_answer"]).upper():
             correct_num += 1
         corrent_num += 1
-        print(f"correct_num: {correct_num}, corrent_num: {corrent_num}, accuracy: {correct_num/corrent_num}")
-        
-        # 获取检索信息
-        retrieved_indices = get_last_retrieved_indices()
-        if retrieved_indices is not None:
-            print(f"检索到的块索引: {retrieved_indices}")
+        print(f"correct_num: {correct_num}, corrent_num: {corrent_num}, accuracy: {correct_num/corrent_num:.3f}")
+
+        # 读取检索信息（新接口优先，旧缓存兜底）
+        hits = get_last_retrieved_indices(model)
+        if hits is not None:
+            print(f"检索到的块索引: {hits}")
         else:
             print("未检索到相关信息")
-    
-    return answer
+
+    return correct_num, corrent_num
 
 
 if __name__ == "__main__":
-    
-    json_path = './yollava-data/yollava-visual-qa.json'
-    ds =  json.loads(open(json_path).read())
+    json_path = "./yollava-data/yollava-visual-qa.json"
+    ds = json.loads(open(json_path, "r", encoding="utf-8").read())
 
-    
     personalize_set = {}
-    qa =[]
+    qa = []
     for name in ds:
-        personalize_set[name] = {}
-        personalize_set[name]['category'] = None
-        personalize_set[name]['info'] = None
-        personalize_set[name]['images'] = []
-        for filename in os.listdir(f'./yollava-data/train/{name}'):
-            image_path = f'./yollava-data/train/{name}/{filename}'
-            personalize_set[name]['images'].append(Image.open(image_path))
+        personalize_set[name] = {"category": None, "info": None, "images": []}
+        train_dir = f"./yollava-data/train/{name}"
+        for filename in os.listdir(train_dir):
+            image_path = f"{train_dir}/{filename}"
+            personalize_set[name]["images"].append(Image.open(image_path).convert("RGB"))
 
         for j in ds[name]:
-            qa.append({
-                "name": name,
-                "question": ds[name][j]['question'],
-                "image": Image.open(j),
-                "options": ds[name][j]['options'],
-                "correct_answer": ds[name][j]['correct_answer']
-            })
+            qa.append(
+                {
+                    "name": name,
+                    "question": ds[name][j]["question"],
+                    "image": Image.open(j).convert("RGB"),
+                    "options": ds[name][j]["options"],
+                    "correct_answer": ds[name][j]["correct_answer"],
+                }
+            )
 
-    # ===== 新增：从 /home/ubuntu/ken/ReKV/infos.json 注入 info =====
-    infos_path = "/home/ubuntu/ken/ReKV/infos.json"
+    # 从 infos.json 注入 text
+    infos_path = "infos.json"
     try:
         with open(infos_path, "r", encoding="utf-8") as f:
             info_map = json.load(f)
@@ -172,21 +210,15 @@ if __name__ == "__main__":
         print(f"[WARN] 读取 {infos_path} 失败：{e}")
         info_map = {}
 
-    for name in personalize_set:
-        # 若不存在对应条目，则保持 None（不改变其它逻辑）
-        if name in info_map and isinstance(info_map[name], str):
-            personalize_set[name]["info"] = info_map[name]
-
     print("个性化数据集已加载，包含以下项目:")
     for k, v in personalize_set.items():
-        print(f"name: {k}, category: {v['category']}, info: {v['info']}, images num: {len(v['images'])}")
+        if k in info_map and isinstance(info_map[k], str):
+            personalize_set[k]["info"] = info_map[k]
+        print(f"name: {k}, category: {v['category']}, info: {personalize_set[k]['info']}, images num: {len(v['images'])}")
+
     print("图片已经加载，开始个性化测试...")
-    
-    
-    
 
     test_personalization(
         personalize_set=personalize_set,
         qa=qa,
-        model_name="LLaVA/llava-onevision-qwen2-7b-ov-hf"
     )
