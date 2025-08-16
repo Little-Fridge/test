@@ -1,202 +1,260 @@
 import torch
+from transformers import LlavaOnevisionProcessor, LlavaOnevisionForConditionalGeneration
 from logzero import logger
 
+from model.patch import patch_hf
+from model.abstract_rekv import Abstract_ReKV
 
-class Abstract_ReKV:
-    processor = None
-    kv_cache = None
 
-    def __init__(self, processor, n_frame_tokens, init_prompt_ids, n_local, topk, chunk_size):
-        self.processor = processor
-        self.n_frame_tokens = n_frame_tokens
-        self.init_prompt_ids = init_prompt_ids
-        self.n_local = n_local
-        self.topk = topk
-        self.chunk_size = chunk_size
+class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV):
+    def __init__(self, config, processor, n_frame_tokens, init_prompt_ids, n_local, topk, chunk_size):
+        LlavaOnevisionForConditionalGeneration.__init__(self, config)
+        Abstract_ReKV.__init__(self, processor, n_frame_tokens, init_prompt_ids, n_local, topk, chunk_size)
 
-    def clear_cache(self):
-        self.kv_cache = None
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+    def get_prompt(self, query, mc=False):
+        prompt =  f"\n{query}<|im_end|><|im_start|>assistant\n"
+        if mc:
+            prompt += 'Best option: ('
+        return prompt
+    
+    def get_choosing_prompt(self, query, options, mc = True):
+        options_str = "\n".join([f"{k}. {v}" for k, v in options.items()])
+        prompt = f"\n{query}\nOptions:\n{options_str}<|im_end|><|im_start|>assistant\n"
+        if mc:
+            prompt += 'Best option: ('
+        return prompt
 
-    @torch.inference_mode()
-    def encode_init_prompt(self):
-        if not isinstance(self.init_prompt_ids, torch.Tensor):
-            self.init_prompt_ids = torch.as_tensor([self.init_prompt_ids], device=self.device)
-        output = self.language_model(input_ids=self.init_prompt_ids, use_cache=True, return_dict=True)
-        self.kv_cache = output.past_key_values
 
     def _get_video_features(self, pixel_values_videos):
-        pass
+        batch_size, frames, channels, height, width = pixel_values_videos.shape
+        pixel_values_videos = pixel_values_videos.view(batch_size * frames, channels, height, width)
+        video_features = self.vision_tower(pixel_values_videos, output_hidden_states=True)
+        selected_video_feature = video_features.hidden_states[self.config.vision_feature_layer]
 
-    def _encode_video_chunk(self, video_chunk):
-        pixel_values_videos = self.processor.video_processor(video_chunk, return_tensors="pt").pixel_values_videos.to(self.device, self.dtype)  # (1, Nv, 3, H, W)
-        video_features = self._get_video_features(pixel_values_videos)  # (1, Nv*196, D)
-        assert self.n_local >= video_features.shape[1], f'n_local: {self.n_local}, video_features: {video_features.shape[1]}'
+        if self.config.vision_feature_select_strategy == "default":
+            selected_video_feature = selected_video_feature[:, 1:]
+        elif self.config.vision_feature_select_strategy == "full":
+            selected_video_feature = selected_video_feature
+        video_features = self.multi_modal_projector(selected_video_feature)
 
-        output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
-        self.kv_cache = output.past_key_values
-
-    @torch.inference_mode()
-    def encode_video(self, video, encode_chunk_size=64):  # video: (Nv, H, W, 3)
-        # encode chunk by chunk
-        num_frames = video.shape[0]
-        num_chunks = num_frames // encode_chunk_size
-
-        for chunk_idx in range(num_chunks):
-            start_idx = chunk_idx * encode_chunk_size
-            end_idx = start_idx + encode_chunk_size
-            chunk_video = video[start_idx:end_idx]
-            self._encode_video_chunk(chunk_video)
-            logger.debug(f'KV-Cache RAM usage: {self.calc_memory_usage() / (1024**3):.1f} GB')
-
-        # Handle remaining frames
-        remaining_frames = num_frames % encode_chunk_size
-        if remaining_frames > 0:
-            start_idx = num_chunks * encode_chunk_size
-            end_idx = start_idx + remaining_frames
-            remaining_video = video[start_idx:end_idx]
-            self._encode_video_chunk(remaining_video)
-        
-        logger.debug(f'KV-Cache RAM usage: {self.calc_memory_usage() / (1024**3):.1f} GB')
-
+        video_features = self.apply_pooling(video_features)
+        video_features = video_features.reshape(batch_size, frames * video_features.shape[1], -1)  # (B, Nv*196, D)
+        return video_features
 
     @torch.inference_mode()
-    def encode_personalized_pair(self, pair):
-        '''
-        pair = {
-            "id": name,
-            "category": category,
-            "images": [images],
-            "text": text
-        }
-        '''
-        '''encode a personalized pair of image and text with prompt:
-            <image>
-            Name: <id>
-            Category: <category>
-            Description: <text>
-        '''
-        # generate the personalization prompt
-        category = pair.get('category', '')
-        description = pair.get('text', '')
-        id_ = pair['id']
+    def question_answering(self, input_text, max_new_tokens=128, retrieved_indices=None):
+        device = self.device
+        stop_token_ids = [self.processor.tokenizer.eos_token_id]
 
-        # 拼接可选部分
-        optional = ""
-        if category:
-            optional += f"\nCategory: {category}"
-        if description:
-            optional += f"\nDescription: {description}"
+        output_ids = []
+        stopped = False
 
-        if isinstance(pair['images'], list) and len(pair['images']) > 1:
-            prompt = f"<image>\nThese {len(pair['images'])} images show the personalized content: {id_}{optional}"
-        else:
-            prompt = f"<image>\nThis image shows: {id_}{optional}"
-            
-        # 分别处理图像和文本
-        # 1. 处理图像：提取图像特征
-        if isinstance(pair['images'], list):
-            # 如果是多张图片，需要处理成类似视频帧的格式
-            images = pair['images']
-        else:
-            images = [pair['images']]
-        
-        # 使用image_processor单独处理图像，获取pixel_values
-        image_inputs = self.processor.image_processor(
-            images=images,
-            return_tensors="pt"
-        )
-        pixel_values = image_inputs['pixel_values'].to(self.device, self.dtype)
-        
-        # 将图像格式化为类似视频的格式: (1, num_images, 3, H, W)
-        if len(pixel_values.shape) == 4:  # (num_images, 3, H, W)
-            pixel_values = pixel_values.unsqueeze(0)  # (1, num_images, 3, H, W)
-        
-        # 使用_get_video_features方法处理图像
-        image_features = self._get_video_features(pixel_values)  # (1, num_images*196, D)
-        
-        # 2. 处理文本：转换为embeddings
-        text_inputs = self.processor.tokenizer(
-            prompt, 
-            return_tensors="pt",
-            add_special_tokens=False
-        ).to(self.device)
-        
-        text_embeddings = self.get_input_embeddings()(text_inputs.input_ids)  # (1, seq_len, D)
-        
-        # 3. 合并图像特征和文本embeddings
-        # 需要找到<image>标记的位置并替换为图像特征
-        image_token_id = self.processor.tokenizer.convert_tokens_to_ids('<image>')
-        input_ids = text_inputs.input_ids[0]  # (seq_len,)
-        
-        # 找到<image>标记的位置
-        image_positions = (input_ids == image_token_id).nonzero(as_tuple=True)[0]
-        
-        if len(image_positions) > 0:
-            # 构建最终的embeddings序列
-            final_embeddings_list = []
-            last_pos = 0
-            
-            for img_pos in image_positions:
-                # 添加<image>之前的文本embeddings
-                if img_pos > last_pos:
-                    final_embeddings_list.append(text_embeddings[0, last_pos:img_pos])
-                
-                # 添加图像特征
-                final_embeddings_list.append(image_features[0])  # (num_images*196, D)
-                
-                last_pos = img_pos + 1
-            
-            # 添加最后剩余的文本embeddings
-            if last_pos < text_embeddings.shape[1]:
-                final_embeddings_list.append(text_embeddings[0, last_pos:])
-            
-            # 拼接所有embeddings
-            final_embeddings = torch.cat(final_embeddings_list, dim=0).unsqueeze(0)  # (1, total_len, D)
-        else:
-            # 如果没有找到<image>标记，直接拼接
-            final_embeddings = torch.cat([image_features, text_embeddings], dim=1)
+        # NOTE: Only input the question to perform retrieval.
+        input_ids = self.processor.tokenizer(input_text['question']).input_ids
+        input_ids = torch.as_tensor([input_ids], device=device)
+        for layer_kv in self.kv_cache:  # activate retrieval mode
+            layer_kv.set_retrieval()
 
-        # 检查并padding到块大小的倍数（对于ReKV的offloading机制）
-        seq_len = final_embeddings.shape[1]
-        block_size = self.n_frame_tokens  # 196
-        if seq_len % block_size != 0:
-            # 需要padding到下一个块大小的倍数
-            target_len = ((seq_len // block_size) + 1) * block_size
-            padding_len = target_len - seq_len
+        if retrieved_indices is None:  # Internal retrieval
+            out = self.language_model(input_ids=input_ids, use_cache=True, past_key_values=self.kv_cache)
+            past_key_values = out.past_key_values  # Retrieved KV-Cache: L x 2 x (B, h, N, Dh)
+        else:  # External retrieval
+            for layer_kv in self.kv_cache:
+                assert layer_kv.block_size == self.n_frame_tokens, f'block_size: {layer_kv.block_size}, n_frame_tokens: {self.n_frame_tokens}'
+                layer_kv.set_retrieved_block_indices(retrieved_indices)
+            out = self.language_model(input_ids=input_ids, use_cache=True, past_key_values=self.kv_cache)
+            past_key_values = out.past_key_values  # Retrieved KV-Cache: L x 2 x (B, h, N, Dh)
+
+        for layer_kv in self.kv_cache:  # reset to default
+            layer_kv.reset_retrieval()
+
+        for i in range(max_new_tokens):
+            if i == 0:  # prefill
+                input_ids = self.processor.tokenizer(input_text['prompt']).input_ids
+                input_ids = torch.as_tensor([input_ids], device=device)
+                inputs_embeds = self.get_input_embeddings()(input_ids)
+                out = self.language_model(inputs_embeds=inputs_embeds, use_cache=True, past_key_values=past_key_values)
+                past_key_values = out.past_key_values
+                logits = out.logits
+            else:  # decoding
+                out = self.language_model(
+                    input_ids=torch.as_tensor(
+                        [[token]],
+                        device=device,
+                    ),
+                    use_cache=True,
+                    past_key_values=past_key_values,
+                )
+                logits = out.logits
+                past_key_values = out.past_key_values
+
+            last_token_logits = logits[0, -1, :]
             
-            # 创建padding token embeddings (使用tokenizer的pad_token或者零向量)
-            if hasattr(self.processor.tokenizer, 'pad_token_id') and self.processor.tokenizer.pad_token_id is not None:
-                pad_token_id = self.processor.tokenizer.pad_token_id
-                pad_embeddings = self.get_input_embeddings()(torch.tensor([[pad_token_id] * padding_len], device=self.device))
+            _, indices = torch.topk(last_token_logits, 2)
+            tokens = [int(index) for index in indices.tolist()]
+            token = tokens[0]
+
+            output_ids.append(token)
+
+            if token in stop_token_ids:
+                stopped = True
             else:
-                # 如果没有pad_token，使用零向量padding
-                embed_dim = final_embeddings.shape[-1]
-                pad_embeddings = torch.zeros(1, padding_len, embed_dim, device=final_embeddings.device, dtype=final_embeddings.dtype)
-            
-            # 添加padding
-            final_embeddings = torch.cat([final_embeddings, pad_embeddings], dim=1)
+                stopped = False
 
-        # 4. 传递给language_model，使用inputs_embeds而不是原始inputs
-        output = self.language_model(
-            inputs_embeds=final_embeddings,
-            past_key_values=self.kv_cache,
-            use_cache=True,
-            return_dict=True
+            if i == max_new_tokens - 1 or stopped:
+                break
+
+        output = self.processor.tokenizer.decode(
+            output_ids,
+            skip_special_tokens=True,
+            spaces_between_special_tokens=False,
+            clean_up_tokenization_spaces=True,
         )
+        
+        return output
 
-        # update kv-cache
-        self.kv_cache = output.past_key_values
 
-        return self.kv_cache
-    
-    
+
     @torch.inference_mode()
-    def question_answering(self, input_text, max_new_tokens=128):
-        pass
+    def visual_question_answering(self, image, input_text, max_new_tokens=128, retrieved_indices=None):
+        device = self.device
+        stop_token_ids = [self.processor.tokenizer.eos_token_id]
 
-    def calc_memory_usage(self):
-        n_layers = len(self.kv_cache)
-        memory = n_layers * self.kv_cache[0].calculate_cpu_memory()
-        return memory
+        output_ids = []
+        stopped = False
+
+        # NOTE: Only input the question to perform retrieval.
+        input_ids = self.processor.tokenizer(input_text['question']).input_ids
+        input_ids = torch.as_tensor([input_ids], device=device)
+        for layer_kv in self.kv_cache:  # activate retrieval mode
+            layer_kv.set_retrieval()
+
+        if retrieved_indices is None:  # Internal retrieval
+            out = self.language_model(input_ids=input_ids, use_cache=True, past_key_values=self.kv_cache)
+            past_key_values = out.past_key_values  # Retrieved KV-Cache: L x 2 x (B, h, N, Dh)
+        else:  # External retrieval
+            for layer_kv in self.kv_cache:
+                assert layer_kv.block_size == self.n_frame_tokens, f'block_size: {layer_kv.block_size}, n_frame_tokens: {self.n_frame_tokens}'
+                layer_kv.set_retrieved_block_indices(retrieved_indices)
+            out = self.language_model(input_ids=input_ids, use_cache=True, past_key_values=self.kv_cache)
+            past_key_values = out.past_key_values  # Retrieved KV-Cache: L x 2 x (B, h, N, Dh)
+
+        for layer_kv in self.kv_cache:  # reset to default
+            layer_kv.reset_retrieval()
+
+        for i in range(max_new_tokens):
+            if i == 0:  # prefill
+                # 分别处理图像和文本，类似encode_personalized_pair的实现
+                # 1. 处理图像特征
+                if isinstance(image, list):
+                    images = image
+                else:
+                    images = [image]
+                
+                # 使用image_processor单独处理图像
+                image_inputs = self.processor.image_processor(
+                    images=images,
+                    return_tensors="pt"
+                )
+                pixel_values = image_inputs['pixel_values'].to(self.device, self.dtype)
+                
+                # 格式化为类似视频的格式: (1, num_images, 3, H, W)
+                if len(pixel_values.shape) == 4:
+                    pixel_values = pixel_values.unsqueeze(0)
+                
+
+                image_features = self._get_video_features(pixel_values)
+                
+                text_inputs = self.processor.tokenizer(
+                    input_text['prompt'], 
+                    return_tensors="pt",
+                    add_special_tokens=False
+                ).to(self.device)
+                
+                text_embeddings = self.get_input_embeddings()(text_inputs.input_ids)
+                
+                final_embeddings = torch.cat([image_features, text_embeddings], dim=1)
+
+                # 4. 传递给language_model
+                out = self.language_model(inputs_embeds=final_embeddings, use_cache=True, past_key_values=past_key_values)
+                
+                past_key_values = out.past_key_values
+                logits = out.logits
+            else:  # decoding
+                out = self.language_model(
+                    input_ids=torch.as_tensor(
+                        [[token]],
+                        device=device,
+                    ),
+                    use_cache=True,
+                    past_key_values=past_key_values,
+                )
+                logits = out.logits
+                past_key_values = out.past_key_values
+
+            last_token_logits = logits[0, -1, :]
+            
+            _, indices = torch.topk(last_token_logits, 2)
+            tokens = [int(index) for index in indices.tolist()]
+            token = tokens[0]
+
+            output_ids.append(token)
+
+            if token in stop_token_ids:
+                stopped = True
+                print(f"Stopped at token {i}, stop_token: {token}")
+            else:
+                stopped = False
+
+            if i == max_new_tokens - 1 or stopped:
+                break
+
+        output = self.processor.tokenizer.decode(
+            output_ids,
+            skip_special_tokens=True,
+            spaces_between_special_tokens=False,
+            clean_up_tokenization_spaces=True,
+        )
+        
+        return output
+
+def load_model(model_path='model_zoo/LLaVA/llava-onevision-qwen2-7b-ov-hf',
+               n_init=None, n_local=None, topk=64, chunk_size=1):
+    device = 'cuda'
+    n_frame_tokens = 196
+    processor = LlavaOnevisionProcessor.from_pretrained(model_path)
+    
+    init_prompt = '<|im_start|>system \nYou are a helpful assistant.<|im_end|><|im_start|>user '
+    init_prompt_ids = processor.tokenizer(init_prompt, return_tensors="pt").input_ids.to(device)
+    inf_llm_config = {
+        'n_init': init_prompt_ids.shape[1] if n_init is None else n_init,
+        'n_local': n_local,
+        'fattn': True,
+        'block_size': n_frame_tokens,
+        'topk': topk,
+        'chunk_size': chunk_size,
+        'max_cached_block': 128,
+        'exc_block_size': n_frame_tokens,
+        'pin_memory': True,
+    }
+    model = LlavaOneVision_ReKV.from_pretrained(
+        model_path, 
+        device_map="auto",
+        low_cpu_mem_usage=True, 
+        torch_dtype=torch.float16,
+        processor=processor,
+        n_frame_tokens=n_frame_tokens,
+        init_prompt_ids=init_prompt_ids,
+        n_local=n_local,
+        topk=topk,
+        chunk_size=chunk_size,
+    )
+    model.language_model = patch_hf(model.language_model, **inf_llm_config)
+    
+    for k, v in inf_llm_config.items():
+        logger.info(f'{k}: {v}')
+    logger.info(f'n_frame_tokens: {n_frame_tokens}')
+
+    model.eval()
+
+    return model, processor

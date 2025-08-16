@@ -43,7 +43,9 @@ class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV)
 
     @torch.inference_mode()
     def question_answering(self, input_text, max_new_tokens=128, retrieved_indices=None):
-        device = self.device
+        # 以 language_model 的参数为准，统一 device/dtype，避免后续不一致
+        lm_param = next(self.language_model.parameters())
+        device = lm_param.device
         stop_token_ids = [self.processor.tokenizer.eos_token_id]
 
         output_ids = []
@@ -117,7 +119,12 @@ class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV)
 
     @torch.inference_mode()
     def visual_question_answering(self, image, input_text, max_new_tokens=128, retrieved_indices=None):
-        device = self.device
+        # —— 统一到 language_model 所在的 device/dtype，避免 torch.cat 设备不一致 —— #
+        lm_param = next(self.language_model.parameters())
+        lm_device = lm_param.device
+        lm_dtype = lm_param.dtype
+        device = lm_device  # 后续用到的 device 一律用 LM 的 device
+
         stop_token_ids = [self.processor.tokenizer.eos_token_id]
 
         output_ids = []
@@ -156,22 +163,30 @@ class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV)
                     images=images,
                     return_tensors="pt"
                 )
-                pixel_values = image_inputs['pixel_values'].to(self.device, self.dtype)
+                # —— 图像先放到 vision_tower 的设备与精度上，确保前向不跨卡 —— #
+                vt_param = next(self.vision_tower.parameters())
+                vt_device = vt_param.device
+                vt_dtype = vt_param.dtype
+                pixel_values = image_inputs['pixel_values'].to(vt_device, vt_dtype)
                 
                 # 格式化为类似视频的格式: (1, num_images, 3, H, W)
                 if len(pixel_values.shape) == 4:
                     pixel_values = pixel_values.unsqueeze(0)
                 
-
-                image_features = self._get_video_features(pixel_values)
+                image_features = self._get_video_features(pixel_values)  # [B, L_img, H]
                 
+                # 2. 文本嵌入（先在 LM 设备上取 ids，再做 embedding）
                 text_inputs = self.processor.tokenizer(
                     input_text['prompt'], 
                     return_tensors="pt",
                     add_special_tokens=False
-                ).to(self.device)
-                
-                text_embeddings = self.get_input_embeddings()(text_inputs.input_ids)
+                )
+                text_inputs = text_inputs.to(device)
+                text_embeddings = self.get_input_embeddings()(text_inputs.input_ids)  # [B, L_txt, H]
+
+                # 3. 在拼接前，把两者统一到 **同一 device 与 dtype（LM）**
+                image_features = image_features.to(device=lm_device, dtype=lm_dtype, non_blocking=True)
+                text_embeddings = text_embeddings.to(device=lm_device, dtype=lm_dtype, non_blocking=True)
                 
                 final_embeddings = torch.cat([image_features, text_embeddings], dim=1)
 

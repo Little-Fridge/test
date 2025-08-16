@@ -66,9 +66,24 @@ class MemoryUnit:
 
     # Load data from the CPU to the GPU and copy it to 'target' when necessary.
     # target: 2x (n_head, n_token, head_dim), on GPU
-    def load(self, target: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> bool:
+    def load(self, target: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
+        # 添加数据有效性检查
+        if (self.cpu_data is None or 
+            len(self.cpu_data) < 2 or 
+            self.cpu_data[0] is None or 
+            self.cpu_data[1] is None or
+            self.cpu_data[0].numel() == 0 or 
+            self.cpu_data[1].numel() == 0):
+            print(f"警告: 尝试加载无效或空的块数据")
+            return False, None  # 返回False表示加载失败
+            
         if self.gpu_data is not None:
             if target is not None:
+                # 检查目标张量大小是否匹配
+                if (target[0].shape != self.gpu_data[0].shape or 
+                    target[1].shape != self.gpu_data[1].shape):
+                    print(f"警告: 目标张量大小不匹配. target[0]: {target[0].shape}, gpu_data[0]: {self.gpu_data[0].shape}")
+                    return False, None
                 target[0].copy_(self.gpu_data[0], non_blocking=True)
                 target[1].copy_(self.gpu_data[1], non_blocking=True)
                 target_event = torch.cuda.Event()
@@ -76,11 +91,17 @@ class MemoryUnit:
             else:
                 target_event = None
 
-            return False, target_event
+            return True, target_event
 
         gpu_data, gpu_data_id = self.cache.alloc()
         gpu_data = gpu_data.view((2,) + self.cpu_data[0].shape)
         if target is not None:
+            # 检查目标张量大小是否匹配
+            if (target[0].shape != self.cpu_data[0].shape or 
+                target[1].shape != self.cpu_data[1].shape):
+                print(f"警告: 目标张量大小不匹配. target[0]: {target[0].shape}, cpu_data[0]: {self.cpu_data[0].shape}")
+                self.cache.delete(gpu_data_id)  # 释放已分配的GPU内存
+                return True, None
             target[0].copy_(self.cpu_data[0], non_blocking=True)
             target[1].copy_(self.cpu_data[1], non_blocking=True)
             target_event = torch.cuda.Event()
@@ -210,6 +231,15 @@ class ContextManager:
         self.chunk_info = []  # List of chunk info for each unit: [unit_id][chunk_id] = (start_idx, size)
         self.chunk_scores = []  # List of chunk scores for each unit: [unit_id][chunk_id] = score
         
+        # Pair-based management for personalized retrieval
+        self.pairs = {}  # pair_id -> {"image_key": tensor, "text_key": tensor, "blocks": [block_indices]}
+        self.current_encoding_pair = None  # Currently encoding pair info
+        self.current_pair_tokens = {"image_start": None, "image_end": None, "text_start": None, "text_end": None}
+        
+        # Global pair selection cache - all layers use the same selected pairs
+        self.cached_selected_pairs = None  # Cache selected pairs for consistency across layers
+        self.cached_selected_blocks = None  # Cache selected blocks for consistency across layers
+        
         self.Attn, _ = get_multi_stage_dot_production_attention(fattn)
         self.fattn = fattn
         self.initialized = False
@@ -319,7 +349,8 @@ class ContextManager:
         # buffering global KV during attention computations
         # (2, batch_size, n_head_kv, L, dim_head)
         # L = n_init + n_retrieve
-        buffer_len = self.topk * self.block_size + self.n_init
+        # 增加buffer大小以支持更多blocks
+        buffer_len = max(self.topk * self.block_size + self.n_init, 10000)  # 至少10000个token
         self.global_buffer = torch.zeros(
                 (2, self.num_units, self.unit_size_kv, buffer_len , dim_head),
                 dtype = global_k.dtype, device=global_k.device
@@ -341,6 +372,9 @@ class ContextManager:
         self.similarity = None
         self.retrieved_block_indices = None
         self.to_retrieve = False
+        # Reset pair selection cache for new retrieval session
+        self.cached_selected_pairs = None
+        self.cached_selected_blocks = None
 
     def set_retrieved_block_indices(self, retrieved_block_indices):
         # retrieved_block_indices (list): batch_size x n_frames
@@ -353,12 +387,30 @@ class ContextManager:
         query: (batch_size, num_heads, length, dim_head)
         return [init_k, retrieved_k] and the respective v
         """
+        self.cached_selected_blocks = None
+        self.cached_selected_pairs = None
 
         if query is not None:  # retrieve based on the attention score between query and context's representative keys
-            block_topk = self._calc_block_topk(query)
+            # Use pair-based retrieval if pairs exist, otherwise fall back to block-based
+            if len(self.pairs) > 0:
+                block_topk = self._calc_pair_based_topk(query)
+            else:
+                block_topk = self._calc_block_topk(query)
             self.set_retrieved_block_indices(block_topk)
 
         assert len(self.retrieved_block_indices) == self.num_units
+
+        # —— 保险：对每个 batch 单元做一次 去重→排序→截断到 topk —— #
+        for u in range(self.num_units):
+            uniq_sorted = sorted(set(self.retrieved_block_indices[u]))
+            if self.topk is not None and self.topk > 0:
+                uniq_sorted = uniq_sorted[: self.topk]
+            self.retrieved_block_indices[u] = uniq_sorted
+
+        # 检查global_buffer是否已初始化
+        if self.global_buffer is None:
+            print("错误: global_buffer未初始化")
+            return None, None
 
         global_h_k = self.global_buffer[0]
         global_h_v = self.global_buffer[1]
@@ -377,22 +429,54 @@ class ContextManager:
                 for u in range(self.num_units):
                     for b_idx in self.retrieved_block_indices[u]:
                         self.cached_blocks[u][b_idx] = self.load_count
-                
+
                 # no need to load init KV
                 init_st = 0
                 init_ed = init_st + self.init_k.size(-2)
                 ed = init_ed
                 assert self.global_buffer_init_st == init_st or self.global_buffer_init_ed == init_ed
 
+                # 计算需要的总空间
+                total_retrieved_blocks = max((len(self.retrieved_block_indices[u]) for u in range(self.num_units)), default=0)
+                required_length = init_ed + total_retrieved_blocks * self.block_size
+                current_length = global_h_k.size(-2)
+
+                # 如果当前缓冲区不够大，需要扩展
+                if required_length > current_length:
+                    print(f"警告: global buffer太小 (当前: {current_length}, 需要: {required_length})，扩展缓冲区")
+                    original_shape = self.global_buffer.shape
+                    new_shape = list(original_shape)
+                    new_shape[-2] = required_length
+                    new_global_buffer = torch.zeros(
+                        new_shape,
+                        device=self.global_buffer.device,
+                        dtype=self.global_buffer.dtype
+                    )
+                    new_global_buffer[..., :current_length, :] = self.global_buffer
+                    self.global_buffer = new_global_buffer
+                    global_h_k = self.global_buffer[0]
+                    global_h_v = self.global_buffer[1]
+
                 # load retrieved context KV
                 for u in range(self.num_units):
-                    # assert len(self.retrieved_block_indices[u]) == block_num
+                    if len(self.retrieved_block_indices[u]) == 0:
+                        continue
                     assert self.retrieved_block_indices[u][-1] < self.num_global_block, f'{self.retrieved_block_indices[u][-1]}, {self.num_global_block}'
                     for cnt, b_idx in enumerate(self.retrieved_block_indices[u]):
-                        # load global_blocks[u][b_idx] onto GPU and make a copy to (global_h_k, global_h_v)
                         st = init_ed + cnt * self.block_size
                         ed = st + self.block_size
-                        self.global_blocks[u][b_idx].load((global_h_k[u, :, st:ed, :], global_h_v[u, :, st:ed, :]))
+                        if ed > global_h_k.size(-2):
+                            print(f"警告: 块加载超出缓冲区范围 (st={st}, ed={ed}, buffer_size={global_h_k.size(-2)})，跳过块 {b_idx}")
+                            continue
+                        target_k = global_h_k[u, :, st:ed, :]
+                        target_v = global_h_v[u, :, st:ed, :]
+                        if target_k.size(-2) == 0 or target_v.size(-2) == 0:
+                            print(f"警告: 目标切片大小为0 (st={st}, ed={ed})，跳过块 {b_idx}")
+                            continue
+                        load_result = self.global_blocks[u][b_idx].load((target_k, target_v))
+                        if load_result is not None and not load_result[0]:
+                            print(f"警告: 无法加载块 {b_idx}，跳过此块")
+                            continue
 
             else:  # init KV and context are in self.global_remainder
                 # load init KV
@@ -402,28 +486,34 @@ class ContextManager:
                 global_h_v[:, :, init_st:init_ed] = self.global_remainder[1][:, :, init_st:init_ed]
                 ed = init_ed
 
-                # load retrieved context KV
+                # 允许 <= topk，而不是强制等于 topk
                 for u in range(self.num_units):
-                    # assert len(self.retrieved_block_indices[u]) == block_num
+                    # （此处不再使用原先的严格断言）
                     for cnt, b_idx in enumerate(self.retrieved_block_indices[u]):
-                        remainder_st = init_ed + b_idx * self.block_size
-                        remainder_ed = remainder_st + self.block_size
-                        if remainder_st >= self.global_remainder[0].size(2):
-                            break
                         st = init_ed + cnt * self.block_size
                         ed = st + self.block_size
-                        global_h_k[u, :, st:ed] = self.global_remainder[0][u, :, remainder_st:remainder_ed]
-                        global_h_v[u, :, st:ed] = self.global_remainder[1][u, :, remainder_st:remainder_ed]
+                        block_start = self.n_init + b_idx * self.block_size
+                        block_end = self.n_init + (b_idx + 1) * self.block_size
+                        assert block_end <= self.global_remainder[0].size(-2), f"Block {b_idx} is out of local window range"
+                        global_h_k[u, :, st:ed, :] = self.global_remainder[0][u, :, block_start:block_end, :]
+                        global_h_v[u, :, st:ed, :] = self.global_remainder[1][u, :, block_start:block_end, :]
 
-            global_h_k = global_h_k[:, :, :ed, :]
-            global_h_v = global_h_v[:, :, :ed, :]
-            # assert global_h_k.size(-2) == global_h_v.size(-2) == self.n_init + block_num * self.block_size
+        # 检查是否有有效的检索结果
+        if ed <= self.global_buffer_init_st:
+            empty_k = torch.empty(
+                (self.num_units, self.unit_size_kv, 0, self.dim_head),
+                device=global_h_k.device, dtype=global_h_k.dtype
+            )
+            empty_v = torch.empty(
+                (self.num_units, self.unit_size_kv, 0, self.dim_head),
+                device=global_h_v.device, dtype=global_h_v.dtype
+            )
+            return empty_k, empty_v
 
-        if self.async_global_stream:
-            torch.cuda.current_stream().wait_stream(GLOBAL_STREAM)
+        retrieved_k = global_h_k[:, :, self.global_buffer_init_st:ed, :]
+        retrieved_v = global_h_v[:, :, self.global_buffer_init_st:ed, :]
+        return retrieved_k, retrieved_v
 
-        assert global_h_k.size(-2) <= self.n_init + self.n_local
-        return global_h_k, global_h_v 
 
     # Get the indices of the top-k vectors in self.block_k[u] that have the highest similarity with global_h_q[u].
     # ret: batch_size x topk (dynamic, no chunk size constraints)
@@ -480,6 +570,213 @@ class ContextManager:
                     self.chunk_scores[u].append(chunk_score)
 
         return ret
+    
+    def _calc_pair_based_topk(self, global_h_q):
+        """
+        Pair-based retrieval —— 对 block 逐个打分并全局取 top-k（仅在属于若干高先验的 pair 的 blocks 上打分）。
+        改进点：
+        1) 使用 pair 先验：q 与 pair 的 text_key / image_key 的余弦相似度作为先验，加到 block 分数上；
+        2) 候选对齐：优先从先验得分最高的若干个 pair 收集候选块，必要时再向后补齐；
+        3) MMR 选取：在候选上做最大边际相关性（兼顾相关性与多样性），减少重复块。
+        不新增其他函数；所有计算均在本函数内部完成。
+        """
+        if len(self.pairs) == 0:
+            return self._calc_block_topk(global_h_q)
+
+        # 同一轮（同一 query）的后续层直接复用
+        if self.cached_selected_blocks is not None:
+            return self.cached_selected_blocks
+
+        # -------- 1) 最近 token 加权聚合 query --------
+        # global_h_q: (B, H, L, D)
+        B, H, L, D = global_h_q.shape
+        device = global_h_q.device
+
+        # 线性增长的权重，强调序列尾部
+        w = torch.linspace(0.1, 1.0, steps=L, device=device)       # (L,)
+        w = w / (w.sum() + 1e-12)
+
+        # 带权平均并拉平到 (B, H*D)
+        q_agg = torch.einsum('bhld,l->bhd', global_h_q.float(), w)  # (B, H, D)
+        q_agg = q_agg.reshape(B, H * D)                              # (B, H*D)
+
+        # 一些可调超参（可按需要微调）
+        ALPHA = 0.70   # block 本体分数权重
+        BETA  = 0.30   # pair 先验权重
+        LAMBDA = 0.70  # MMR 的相关性权重（1-LAMBDA 为多样性权重）
+        TOPP = 3       # 先取先验最高的前 TOPP 个 pair 作为主要候选来源
+        CAND_CAP = 2048  # 进入 MMR 前的候选上限，避免显存爆
+
+        eps = 1e-6
+        ret = []
+
+        for u in range(self.num_units):
+            q = q_agg[u]                                # (H*D,)
+            q_norm = torch.linalg.norm(q)
+            if q.numel() == 0 or q_norm <= eps:
+                ret.append([])
+                continue
+            qn = q / q_norm                             # 单位化的 query
+
+            # -------- 2) 计算每个 pair 的先验得分（与 query 的相似度）--------
+            # 选取 text_key / image_key 与 qn 的最大余弦作为该 pair 先验
+            pair_ids = list(self.pairs.keys())
+            pair_scores = []
+            for pid in pair_ids:
+                pinfo = self.pairs[pid]
+                prior = 0.0
+                for kname in ("text_key", "image_key"):
+                    key = pinfo.get(kname, None)
+                    if key is None:
+                        continue
+                    v = key.to(qn.device, qn.dtype).float()
+                    # 对齐维度（截断或 pad）
+                    if v.numel() != qn.numel():
+                        Lq = qn.numel()
+                        if v.numel() > Lq:
+                            v = v[:Lq]
+                        else:
+                            pad = torch.zeros(Lq - v.numel(), device=qn.device, dtype=qn.dtype)
+                            v = torch.cat([v, pad], dim=0)
+                    v = torch.nn.functional.normalize(v, dim=0)
+                    prior = max(prior, torch.dot(v, qn).item())
+                pair_scores.append(prior)
+
+            pair_scores = torch.tensor(pair_scores, device=device, dtype=torch.float32)
+            # 先取先验最高的 TOPP 个 pair（若不足则全取）
+            if pair_scores.numel() > 0:
+                topP = min(TOPP, pair_scores.numel())
+                _, top_pair_pos = torch.topk(pair_scores, k=topP, largest=True, sorted=True)
+                top_pair_ids = [pair_ids[int(i)] for i in top_pair_pos]
+            else:
+                top_pair_ids = []
+
+            # -------- 3) 只在若干高先验 pair 的 blocks 上做候选，必要时补齐 --------
+            Bmat = self.block_k[u].get_data()           # (n_blocks, H*D)
+            if Bmat.numel() == 0:
+                ret.append([])
+                continue
+            n_blocks = Bmat.size(0)
+
+            candidate_blocks = []
+            # 先从高先验的 pair 收集
+            for pid in top_pair_ids:
+                blks = self.pairs[pid].get("blocks", [])
+                for b in blks:
+                    if 0 <= b < self.num_global_block and b < n_blocks:
+                        candidate_blocks.append(b)
+
+            # 若候选太少，再从剩余 pair 补齐
+            if len(candidate_blocks) < self.topk:
+                for pid in pair_ids:
+                    if pid in top_pair_ids:
+                        continue
+                    blks = self.pairs[pid].get("blocks", [])
+                    for b in blks:
+                        if 0 <= b < self.num_global_block and b < n_blocks:
+                            candidate_blocks.append(b)
+                    if len(candidate_blocks) >= self.topk:
+                        break
+
+            if len(candidate_blocks) == 0:
+                ret.append([])
+                continue
+
+            cand_idx = torch.tensor(sorted(set(candidate_blocks)), device=Bmat.device, dtype=torch.long)
+
+            # -------- 4) 候选块矩阵 + 去均值 + 行归一化 --------
+            X = Bmat.index_select(0, cand_idx).float()      # (N, H*D)
+            mu = X.mean(dim=0, keepdim=True)                # (1, H*D)
+            Xc = X - mu
+            x_norms = torch.linalg.norm(Xc, dim=1)          # (N,)
+            valid = x_norms > eps
+            if not torch.any(valid):
+                ret.append([])
+                continue
+
+            Xn = Xc[valid] / x_norms[valid].unsqueeze(1)    # (N_valid, H*D)
+            cand_idx_valid = cand_idx[valid]                # (N_valid,)
+
+            # q'：从 qn 中减去均值方向并归一化
+            mu_dir = mu.squeeze(0)
+            mu_norm = torch.linalg.norm(mu_dir) + eps
+            mu_dir = mu_dir / mu_norm
+            q_prime = torch.nn.functional.normalize(qn - mu_dir, dim=0)
+
+            # 基础相似度（块本体分数）
+            base_scores = torch.mv(Xn, q_prime)             # (N_valid,)
+
+            # -------- 5) 为每个候选块叠加其所属 pair 的先验分 --------
+            # 先做 block -> pair_prior 的映射表
+            block_prior = {}
+            for i, pid in enumerate(pair_ids):
+                prior = pair_scores[i].item() if pair_scores.numel() > 0 else 0.0
+                blks = self.pairs[pid].get("blocks", [])
+                for b in blks:
+                    if 0 <= b < self.num_global_block and b < n_blocks:
+                        if b in block_prior:
+                            block_prior[b] = max(block_prior[b], prior)
+                        else:
+                            block_prior[b] = prior
+
+            prior_scores = torch.zeros_like(base_scores)
+            for j, b in enumerate(cand_idx_valid.tolist()):
+                prior_scores[j] = block_prior.get(b, 0.0)
+
+            fused_scores = ALPHA * base_scores + BETA * prior_scores  # (N_valid,)
+
+            # -------- 6) 进入 MMR 前可做一个候选截断（效率考虑）--------
+            N_valid = fused_scores.size(0)
+            if N_valid > CAND_CAP:
+                # 先取分数前 CAND_CAP 的候选进入 MMR
+                _, pre_top = torch.topk(fused_scores, k=CAND_CAP, largest=True, sorted=False)
+                Xn = Xn.index_select(0, pre_top)
+                fused_scores = fused_scores.index_select(0, pre_top)
+                cand_idx_valid = cand_idx_valid.index_select(0, pre_top)
+                N_valid = CAND_CAP
+
+            # -------- 7) MMR：相关性-多样性联合选择 --------
+            k = int(min(self.topk, N_valid))
+            if k <= 0:
+                chosen = []
+            else:
+                # 预计算候选两两相似度（单位化后的余弦）
+                # S[i, j] = <Xn[i], Xn[j]>
+                S = Xn @ Xn.t()  # (N_valid, N_valid)
+                selected = []
+                selected_mask = torch.zeros(N_valid, dtype=torch.bool, device=device)
+                # 初始化与“已选集合”的最大相似度为 0
+                max_sim_to_sel = torch.zeros(N_valid, device=device)
+
+                for _ in range(k):
+                    # 组合分数：LAMBDA * 相关性 - (1-LAMBDA) * 与已选最大相似度
+                    combined = LAMBDA * fused_scores - (1.0 - LAMBDA) * max_sim_to_sel
+                    # 已选的不再考虑
+                    combined = torch.where(selected_mask, torch.full_like(combined, float("-inf")), combined)
+                    idx = int(torch.argmax(combined).item())
+                    if combined[idx].item() == float("-inf"):
+                        break
+                    selected.append(idx)
+                    selected_mask[idx] = True
+                    # 更新所有候选相对“已选集合”的最大相似度
+                    max_sim_to_sel = torch.maximum(max_sim_to_sel, S[:, idx])
+
+                chosen = cand_idx_valid.index_select(0, torch.tensor(selected, device=device, dtype=torch.long)).tolist()
+
+            # 缓存当轮结果，供本轮后续 layer 复用
+            if u == 0:
+                self.cached_selected_blocks = [chosen.copy() for _ in range(self.num_units)]
+            ret.append(chosen)
+
+        return ret
+
+
+
+
+
+    
+
+
 
     # load init KV
     def get_global_hidden_and_mask(self, exc_length):
@@ -590,9 +887,12 @@ class ContextManager:
         global_remainder_st = self._global_remainder_st
 
         global_remainder_len = global_remainder_ed - global_remainder_st
+        
+        # print(f"DEBUG: _append_global调用, init_exc={self.init_exc}, global_remainder_len={global_remainder_len}, block_size={self.block_size}, current_pair={self.current_encoding_pair['pair_id'] if self.current_encoding_pair else None}")
 
-        # offload context KV to CPU
+        # offload context KV to CPU and create blocks for pair tracking
         if self.init_exc:
+            # print(f"DEBUG: init_exc=True分支，创建blocks")
             assert global_remainder_len % self.block_size == 0, f'global_remainder_len: {global_remainder_len}, block_size: {self.block_size}'
             while global_remainder_len > 0:
                 global_remainder_len -= self.block_size
@@ -621,8 +921,40 @@ class ContextManager:
                 for u in range(self.num_units):
                     self.block_k[u].append(global_block_k[u])
                 
+                # Add block to current pair if we're encoding a pair
+                if self.current_encoding_pair is not None:
+                    self.add_block_to_current_pair(self.num_global_block)
+                
                 self.num_global_block += 1
                 global_remainder_st += self.block_size
+        else:
+            # print(f"DEBUG: init_exc=False分支，检查是否可以创建blocks")
+            # Even in non-init_exc stage, we should track blocks for pair management
+            # Check if we have enough tokens to form complete blocks
+            if global_remainder_len >= self.block_size and global_remainder_len % self.block_size == 0:
+                # print(f"DEBUG: 满足创建条件，创建 {global_remainder_len // self.block_size} 个blocks")
+                blocks_to_create = global_remainder_len // self.block_size
+                for _ in range(blocks_to_create):
+                    # Create representative keys for block tracking even if not offloading
+                    global_block_k = self.global_remainder[0][:, :, global_remainder_st:global_remainder_st + self.block_size, :]
+                    global_block_k = self._from_group_kv(global_block_k)  # (batch_size, num_heads, length, dim_head)
+
+                    global_block_k = global_block_k.mean(dim=-2, keepdim=False)  # (batch_size, num_heads, dim_head)
+                    global_block_k = global_block_k.reshape(self.num_units, -1)  # (batch_size, num_heads * dim_head)
+                    global_block_k = global_block_k[:, None, :]  # (batch_size, 1, num_heads * dim_head)
+                    for u in range(self.num_units):
+                        self.block_k[u].append(global_block_k[u])
+                    
+                    # Add block to current pair if we're encoding a pair
+                    if self.current_encoding_pair is not None:
+                        self.add_block_to_current_pair(self.num_global_block)
+                    
+                    self.num_global_block += 1
+                    global_remainder_st += self.block_size
+                    global_remainder_len -= self.block_size
+            else:
+                # print(f"DEBUG: 不满足创建条件，global_remainder_len={global_remainder_len}, block_size={self.block_size}")
+                pass
 
         self._global_remainder_ed = global_remainder_ed
         self._global_remainder_st = global_remainder_st
@@ -828,3 +1160,60 @@ class ContextManager:
         if unit_id is not None:
             return self.chunk_scores[unit_id] if unit_id < len(self.chunk_scores) else []
         return self.chunk_scores
+
+    def set_current_encoding_pair(self, pair_id, image_features, text_embeddings):
+        """
+        Set the currently encoding pair information for tracking
+        
+        Args:
+            pair_id: identifier of the current pair
+            image_features: image features tensor for creating representative key
+            text_embeddings: text embeddings tensor for creating representative key
+        """
+        # Create representative keys for image and text
+        # Image key: average pooling over image features
+        if image_features is not None:
+            image_key = image_features.mean(dim=1).flatten()  # Average over sequence dimension
+        else:
+            image_key = None
+            
+        # Text key: average pooling over text embeddings  
+        if text_embeddings is not None:
+            text_key = text_embeddings.mean(dim=1).flatten()  # Average over sequence dimension
+        else:
+            text_key = None
+            
+        self.current_encoding_pair = {
+            "pair_id": pair_id,
+            "image_key": image_key,
+            "text_key": text_key,
+            "blocks": []  # Will be populated as blocks are created
+        }
+        
+        print(f"DEBUG: 开始编码pair {pair_id}, init_exc={self.init_exc}, num_global_block={self.num_global_block}, length={self.length}")
+        
+    def add_block_to_current_pair(self, block_idx):
+        """
+        Add a block index to the currently encoding pair
+        """
+        if self.current_encoding_pair is not None:
+            self.current_encoding_pair["blocks"].append(block_idx)
+            print(f"DEBUG: 为pair {self.current_encoding_pair['pair_id']} 添加block {block_idx}")
+        else:
+            print(f"DEBUG: 警告: 尝试添加block {block_idx} 但没有当前编码的pair")
+            
+    def finalize_current_pair(self):
+        """
+        Finalize the current pair encoding and store it
+        """
+        if self.current_encoding_pair is not None:
+            pair_id = self.current_encoding_pair["pair_id"]
+            blocks = self.current_encoding_pair["blocks"]
+            print(f"Pair '{pair_id}' 编码完成，包含blocks: {blocks}")
+            
+            self.pairs[pair_id] = {
+                "image_key": self.current_encoding_pair["image_key"],
+                "text_key": self.current_encoding_pair["text_key"],
+                "blocks": blocks.copy()
+            }
+            self.current_encoding_pair = None
